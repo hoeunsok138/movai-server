@@ -4274,7 +4274,7 @@ async function withProviderKeyRotation(provider, fn, reqKey, candidatesOverride)
 // effort); other providers are added manually by the admin.
 const UPDATES_FILE = path.join(DATA_DIR, 'updates.json');
 const UPDATES_SEED_MODELS = {
-  groq: ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b'],
+  groq: ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'moonshotai/kimi-k2-instruct-0905'],
   novai: ['cogview-3-flash', 'cogvideox-flash'],
   suno: ['v6', 'v6-wild', 'v6-mini'],
   magichour: ['z-image-turbo', 'flux-2-klein', 'flux-schnell', 'qwen-image-2.1', 'krea-2', 'gpt-image-2', 'nano-banana-2.1', 'nano-banana-pro', 'ltx-2.5', 'minimax-h3', 'kling-3.0', 'kling-4.0', 'veo-3.1', 'seedance-2.0', 'seedance-2.5'],
@@ -5063,7 +5063,7 @@ async function apiRoute(req, res, urlPath) {
   const GROQ_LYRICS_MODELS = [
     'openai/gpt-oss-120b',
     'openai/gpt-oss-20b',
-    'qwen/qwen3-32b'
+    'moonshotai/kimi-k2-instruct-0905'
   ];
   const AI_LYRICS_DAILY_LIMIT = 2;
   // Give one AI-Lyrics free slot back (provider call failed before any
@@ -7320,7 +7320,7 @@ async function apiRoute(req, res, urlPath) {
       }
     }
     messages.push({ role: 'user', content: message });
-    const _chatModels = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b'];
+    const _chatModels = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'moonshotai/kimi-k2-instruct-0905'];
     const _cs = _chatModelFlip++ % _chatModels.length;
     const models = _chatModels.slice(_cs).concat(_chatModels.slice(0, _cs));
     let lastErr = null;
