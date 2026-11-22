@@ -1,0 +1,1 @@
+{"dependencies":{"cloudinary":"*","nodemailer":"*","web-push":"*","ws":"*"},"description":"MovAi proxy server — fresh setup. Plain Node.js (built-in http, global fetch/FormData), no framework.","engines":{"node":">=18"},"main":"server.js","name":"movai-server","scripts":{"start":"node server.js"},"version":"1.0.0"}
