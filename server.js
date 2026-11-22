@@ -4151,7 +4151,12 @@ async function mvsepGetSeparation(hash) {
   }
   return { done: false };
 }
-async function mvsepSeparateWithKey(keyValue, audioUrl) {
+async function mvsepSeparateWithKey(keyValue, audioUrl, maxWaitMs) {
+  // The Studio POST waits at most maxWaitMs, then hands the client the
+  // hash so it can poll /status with a visible check count — a long
+  // blind wait is why the owner could not tell whether a split was
+  // working. Default: the full 4-min server poll.
+  const _waitMs = (typeof maxWaitMs === 'number' && maxWaitMs > 0) ? maxWaitMs : MVSEP_POLL_TIMEOUT_MS;
   // Create + poll with ONE key. Only the create step can trigger key
   // rotation (quota errors); a poll timeout / failure is a plain error so
   // a second separation is never created (and no second quota spent).
@@ -4162,12 +4167,12 @@ async function mvsepSeparateWithKey(keyValue, audioUrl) {
   // Record the in-flight job so a re-tap resumes THIS hash instead of
   // creating a duplicate separation on another key.
   await mvsepPendingPut(audioUrl, hash);
-  const deadline = Date.now() + MVSEP_POLL_TIMEOUT_MS;
+  const deadline = Date.now() + _waitMs;
   for (;;) {
     const res = await mvsepGetSeparation(hash);
     if (res.done) return { hash, stems: res.stems, keyUsed: keyValue };
     if (Date.now() >= deadline) {
-      const e = new Error('MVSEP separation still processing after ' + Math.round(MVSEP_POLL_TIMEOUT_MS / 1000) + ' seconds');
+      const e = new Error('MVSEP separation still processing after ' + Math.round(_waitMs / 1000) + ' seconds');
       e.code = 'mvsep_timeout';
       e.hash = hash;
       throw e;
@@ -7692,7 +7697,9 @@ async function apiRoute(req, res, urlPath) {
         let out;
         try {
           out = await withProviderKeyRotation('mvsep', async (k) => {
-            const r = await mvsepSeparateWithKey(k, audioUrl);
+            // 30s max in the POST: after that the client polls /status
+            // with a live check count, so a long split never looks stuck.
+            const r = await mvsepSeparateWithKey(k, audioUrl, 30000);
             return { hash: r.hash, stems: r.stems, keyUsed: k };
           });
         } catch (e) {
