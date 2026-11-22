@@ -1847,7 +1847,7 @@ const ADMIN_EMAILS = ['hoeunsok138@gmail.com'];
 // only (a restart simply asks the admin to sign in again). It is used
 // ONLY to reveal / reset the Admin Key — it never replaces the Admin
 // Key itself, and key-entry attempts keep the graduated lockout.
-const MOVAI_GOOGLE_CLIENT_ID = '809358546010-dspkik0o4ahg7km15dspro5cj3qjk384.apps.googleusercontent.com';
+const MOVAI_GOOGLE_CLIENT_ID = '280046437602-16mnff5qtpeb2jk4r5cass8rmaaj2vof.apps.googleusercontent.com';
 const ADMIN_KEY_SESSION_MS = 15 * 60 * 1000;
 const _adminKeySessions = new Map(); // token -> {email, name, picture, expiresAt}
 const _adminKeyRate = new Map(); // email + ':' + action -> {count, windowStart}
