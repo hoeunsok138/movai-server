@@ -4274,7 +4274,7 @@ async function withProviderKeyRotation(provider, fn, reqKey, candidatesOverride)
 // effort); other providers are added manually by the admin.
 const UPDATES_FILE = path.join(DATA_DIR, 'updates.json');
 const UPDATES_SEED_MODELS = {
-  groq: ['openai/gpt-oss-120b', 'llama-3.1-8b-instant'],
+  groq: ['openai/gpt-oss-120b'],
   novai: ['cogview-3-flash', 'cogvideox-flash'],
   suno: ['v6', 'v6-wild', 'v6-mini'],
   magichour: ['z-image-turbo', 'flux-2-klein', 'flux-schnell', 'qwen-image-2.1', 'krea-2', 'gpt-image-2', 'nano-banana-2.1', 'nano-banana-pro', 'ltx-2.5', 'minimax-h3', 'kling-3.0', 'kling-4.0', 'veo-3.1', 'seedance-2.0', 'seedance-2.5'],
@@ -5058,11 +5058,10 @@ async function apiRoute(req, res, urlPath) {
   // fixed: the AI chooses them to fit the song's lyrics/meaning each
   // time. The Groq key stays server-side (admin-stored keys only);
   // it is NEVER sent to the frontend, never logged, never returned.
-  // Models rotate (gpt-oss-120b first, then llama-3.1-8b-instant)
-  // and keys rotate via withProviderKeyRotation on rotatable errors.
+  // Only gpt-oss-120b: the llama models were decommissioned by Groq.
+  // Keys rotate via withProviderKeyRotation on rotatable errors.
   const GROQ_LYRICS_MODELS = [
-    'openai/gpt-oss-120b',
-    'llama-3.1-8b-instant'
+    'openai/gpt-oss-120b'
   ];
   const AI_LYRICS_DAILY_LIMIT = 2;
   // Give one AI-Lyrics free slot back (provider call failed before any
@@ -7319,8 +7318,8 @@ async function apiRoute(req, res, urlPath) {
       }
     }
     messages.push({ role: 'user', content: message });
-    const _chatModels = ['openai/gpt-oss-120b', 'llama-3.1-8b-instant'];
-    const models = (_chatModelFlip++ % 2 === 0) ? _chatModels : [_chatModels[1], _chatModels[0]];
+    const _chatModels = ['openai/gpt-oss-120b'];
+    const models = _chatModels;
     let lastErr = null;
     let lastReply = null;
     for (const model of models) {
