@@ -7641,27 +7641,14 @@ async function apiRoute(req, res, urlPath) {
         const audioUrl = body && typeof body.audioUrl === 'string' ? body.audioUrl.trim() : '';
         if (!audioUrl || !/^https?:\/\//i.test(audioUrl)) return sendJSON(res, 200, { ok: false, error: 'មិនមាន Link បទចម្រៀងទេ · No song audio URL' });
         const songTitle = body && typeof body.songTitle === 'string' ? body.songTitle.trim().slice(0, 200) : '';
-        // "Free 2 + package allowance" — Vocal Studio gate. Runs BEFORE
-        // any MVSEP call (the cached re-split included), so a rejected
-        // request never consumes MVSEP quota. Package allowance first,
-        // then the 2 free uses. The allowance is consumed when the
-        // split is accepted, even if MVSEP later fails or times out
-        // (same as the generation-credit pattern: checked + deducted
-        // up front). Unknown email -> {ok:false, error:'no_account'};
-        // locked -> {ok:false, error:'vs_out', message} (no MVSEP call).
+        // Account check first (unknown email -> no_account). The
+        // allowance itself is consumed only for a FRESH separation
+        // below — a cached re-split or a resume of a running job
+        // costs nothing (a tap that timed out on the phone must not
+        // burn a second free split).
         const _vsUsers = await loadUsers();
         const _vsU = _vsUsers[email];
         if (!_vsU) return sendJSON(res, 200, { ok: false, error: 'no_account' });
-        // Package allowance is spendable ONLY while a package is
-        // active. An expired package's remaining vsLeft is LOST —
-        // never spent; go straight to the lifetime Free 2 instead.
-        if (hasActivePackage(_vsU) && (_vsU.vsUnlimited || featurePkgLeft(_vsU, 'vsLeft') > 0)) { if (!_vsU.vsUnlimited) _vsU.vsLeft = featurePkgLeft(_vsU, 'vsLeft') - 1; }
-        else if (featureFreeUsed(_vsU, 'freeVsUsed') < FEATURE_FREE_LIMIT) { _vsU.freeVsUsed = featureFreeUsed(_vsU, 'freeVsUsed') + 1; }
-        else if (featureBonus(_vsU, 'bonusVs') > 0) { _vsU.bonusVs = featureBonus(_vsU, 'bonusVs') - 1; }
-        else return sendJSON(res, 200, { ok: false, error: 'vs_out', message: 'You have used your 2 free Vocal Studio splits and have no allowance left — please buy a song package to continue.' });
-        _vsU.updatedAt = new Date().toISOString();
-        await saveUsers(_vsUsers);
-        scheduleBackup('users.json');
         // Fast path: this song was separated before — ask MVSEP for the
         // OLD job's fresh stem URLs instead of creating (and paying quota
         // for) a new separation. Re-splits return in ~1-2s. If the old
@@ -7687,6 +7674,21 @@ async function apiRoute(req, res, urlPath) {
         if (pendingHash) {
           return sendJSON(res, 200, { ok: false, error: 'mvsep_timeout', hash: pendingHash, message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
         }
+        // "Free 2 + package allowance" — consumed only now, for a
+        // fresh separation. Package allowance first, then the 2 free
+        // uses, then bonus. A fresh separation that later fails or
+        // times out still consumes (same as the generation-credit
+        // pattern: checked + deducted up front).
+        // Package allowance is spendable ONLY while a package is
+        // active. An expired package's remaining vsLeft is LOST —
+        // never spent; go straight to the lifetime Free 2 instead.
+        if (hasActivePackage(_vsU) && (_vsU.vsUnlimited || featurePkgLeft(_vsU, 'vsLeft') > 0)) { if (!_vsU.vsUnlimited) _vsU.vsLeft = featurePkgLeft(_vsU, 'vsLeft') - 1; }
+        else if (featureFreeUsed(_vsU, 'freeVsUsed') < FEATURE_FREE_LIMIT) { _vsU.freeVsUsed = featureFreeUsed(_vsU, 'freeVsUsed') + 1; }
+        else if (featureBonus(_vsU, 'bonusVs') > 0) { _vsU.bonusVs = featureBonus(_vsU, 'bonusVs') - 1; }
+        else return sendJSON(res, 200, { ok: false, error: 'vs_out', message: 'You have used your 2 free Vocal Studio splits and have no allowance left — please buy a song package to continue.' });
+        _vsU.updatedAt = new Date().toISOString();
+        await saveUsers(_vsUsers);
+        scheduleBackup('users.json');
         let out;
         try {
           out = await withProviderKeyRotation('mvsep', async (k) => {
