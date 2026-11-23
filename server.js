@@ -5327,7 +5327,7 @@ async function apiRoute(req, res, urlPath) {
     if (!cloudUrl || cloudUrl.indexOf('res.cloudinary.com/') === -1) return null;
     if (cloudUrl.indexOf('/image/upload/l_fetch:') !== -1) return cloudUrl;
     const b64 = Buffer.from(MOVAI_WATERMARK_URL).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    const tr = 'l_fetch:' + b64 + ',w_180,g_south_east,x_12,y_12';
+    const tr = 'l_fetch:' + b64 + ',w_180,g_south_east,x_20,y_20';
     const i = cloudUrl.indexOf('/image/upload/');
     if (i === -1) return null;
     return cloudUrl.slice(0, i + 14) + tr + '/' + cloudUrl.slice(i + 14);
