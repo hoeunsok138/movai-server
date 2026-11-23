@@ -5728,31 +5728,88 @@ async function vidfetchHandleStatus(req, res, body, hooks) {
   }
   return sendJSON(res, 200, out);
 }
+// Per-key /v1/usage for every stored key, in Admin order — one parallel
+// call per key (each key is a different VidFetch account). Never throws.
+// Returns null when no keys are configured, else
+// [{index, used, remaining, limit, exhausted}] with RAW GB numbers.
+// A key whose call fails degrades to {used:null, remaining:null,
+// limit:1, exhausted:false} (1 = its free allowance — shown per key
+// only, never added to the summed totals). `exhausted` is computed
+// from the ROUNDED remaining (the value the client sees): a key with
+// 0.00 GB left on screen is exhausted for real use (one download bills
+// >= 20 MiB), so the flag and the display always agree.
+async function vidfetchUsagePerKey(hooks) {
+  const keys = await vidfetchKeys(hooks);
+  if (!keys.length) return null;
+  const fetchFn = hooks && hooks.fetchFn;
+  const results = await Promise.all(keys.map((k) => vidfetchCallOnce('/v1/usage', 'GET', null, k, fetchFn)));
+  const round2 = (n) => Math.round(n * 100) / 100;
+  return results.map((r, i) => {
+    if (!r.ok || !r.data) return { index: i, used: null, remaining: null, limit: 1, exhausted: false };
+    const q = vidfetchNum(r.data.quota_gb, 0);
+    const u = vidfetchNum(r.data.used_gb, 0);
+    const rem = (typeof r.data.remaining_gb === 'number' && Number.isFinite(r.data.remaining_gb)) ? r.data.remaining_gb : Math.max(0, q - u);
+    return { index: i, used: u, remaining: rem, limit: q, exhausted: round2(rem) <= 0 };
+  });
+}
+// Map per-key usage entries to the Admin key-card shape (what
+// storeProviderUsage/applyProviderUsage consume): 1-based `key`,
+// `used`/`limit`/`remainingToday` in GB, `status` red when exhausted,
+// `unit` "GB" so the renderer prints GB units. A failed key (nulls)
+// keeps status 'unknown' so the card shows "quota unavailable" instead
+// of fake numbers.
+function vidfetchAdminUsageKeys(entries) {
+  const round2 = (n) => Math.round(n * 100) / 100;
+  return (Array.isArray(entries) ? entries : []).map((e) => {
+    const failed = !e || e.used === null || e.used === undefined || e.remaining === null || e.remaining === undefined;
+    if (failed) return { key: (e && typeof e.index === 'number' ? e.index : 0) + 1, used: null, limit: 1, remainingToday: null, status: 'unknown', unit: 'GB' };
+    return { key: e.index + 1, used: round2(e.used), limit: round2(e.limit), remainingToday: round2(e.remaining), status: e.exhausted ? 'red' : 'green', unit: 'GB' };
+  });
+}
+// Live-test ONE key (Admin dots): GET /v1/usage. 200 → ok unless the
+// remaining quota is 0 (blocked/exhausted); 402 → blocked (quota);
+// 401/403 → blocked (bad key); 429 → error (rate limit); anything else
+// or unreachable → error. Never throws, never returns the key.
+async function vidfetchTestKey(key, fetchFn) {
+  const r = await vidfetchCallOnce('/v1/usage', 'GET', null, key, fetchFn);
+  const round2 = (n) => Math.round(n * 100) / 100;
+  if (r.ok && r.data) {
+    const q = vidfetchNum(r.data.quota_gb, 0);
+    const u = vidfetchNum(r.data.used_gb, 0);
+    const rem = (typeof r.data.remaining_gb === 'number' && Number.isFinite(r.data.remaining_gb)) ? r.data.remaining_gb : Math.max(0, q - u);
+    if (round2(rem) <= 0) return { status: 'blocked', message: 'Key នេះអស់ quota ហ្វ្រី 1 GB ខែនេះហើយ · This key used up its 1 GB free quota this month' };
+    return { status: 'ok', message: 'Ready — Key ដំណើរការល្អ' };
+  }
+  if (r.code === 'vidfetch_quota') return { status: 'blocked', message: 'Key នេះអស់ quota ហ្វ្រី 1 GB ខែនេះហើយ · This key used up its 1 GB free quota this month' };
+  if (r.code === 'server_not_configured') return { status: 'blocked', message: 'Key មិនត្រឹមត្រូវ ឬត្រូវបានប្លុក (HTTP 401)' };
+  if (r.code === 'vidfetch_busy') return { status: 'error', message: 'Rate limit (HTTP 429) — សាកល្បងម្ដងទៀតពេលក្រោយ' };
+  return { status: 'error', message: 'VidFetch ឆ្លើយមិនបាន — សូមព្យាយាមម្ដងទៀត · VidFetch did not answer — please try again' };
+}
 // GET /api/download/vidfetch/usage — email → {ok, used_gb,
-// remaining_gb, limit_gb} — sums ACROSS ALL keys (parallel calls),
-// so the page shows the owner's total free allowance. The total
-// limit is the sum of the keys' limits, never hardcoded.
+// remaining_gb, limit_gb, keys:[{index, used_gb, remaining_gb,
+// limit_gb, exhausted}]} — sums ACROSS ALL keys (parallel calls),
+// so the page shows the owner's total free allowance; the per-key
+// array (owner order 2026-11-23 ~18:11) shows each key's own 1 GB,
+// how much it used, and which key is exhausted (remaining_gb <= 0).
+// The total limit is the sum of the keys' limits, never hardcoded.
+// Summed fields are computed from RAW per-key numbers exactly as
+// before; only the per-key entries are rounded to 2 decimals.
 async function vidfetchHandleUsage(req, res, email, hooks) {
   const em = normEmail(email);
   if (!em) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
   const users = await loadUsers();
   if (!users || !users[em]) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
-  const keys = await vidfetchKeys(hooks);
-  if (!keys.length) return sendJSON(res, 200, { ok: false, code: 'server_not_configured', error: VIDFETCH_NO_KEY_ERROR });
-  const fetchFn = hooks && hooks.fetchFn;
-  const results = await Promise.all(keys.map((k) => vidfetchCallOnce('/v1/usage', 'GET', null, k, fetchFn)));
+  const entries = await vidfetchUsagePerKey(hooks);
+  if (!entries) return sendJSON(res, 200, { ok: false, code: 'server_not_configured', error: VIDFETCH_NO_KEY_ERROR });
   let used = 0, remaining = 0, limit = 0, okCount = 0;
-  for (const r of results) {
-    if (!r.ok || !r.data) continue;
+  for (const e of entries) {
+    if (e.used === null || e.remaining === null) continue;
     okCount++;
-    const q = vidfetchNum(r.data.quota_gb, 0);
-    const u = vidfetchNum(r.data.used_gb, 0);
-    const rem = (typeof r.data.remaining_gb === 'number' && Number.isFinite(r.data.remaining_gb)) ? r.data.remaining_gb : Math.max(0, q - u);
-    used += u; remaining += rem; limit += q;
+    used += e.used; remaining += e.remaining; limit += e.limit;
   }
   if (!okCount) return sendJSON(res, 200, { ok: false, code: 'vidfetch_error', error: 'មើល quota មិនបានទេ — សូមព្យាយាមម្ដងទៀត · Could not read the quota — please try again' });
   const round2 = (n) => Math.round(n * 100) / 100;
-  return sendJSON(res, 200, { ok: true, used_gb: round2(used), remaining_gb: round2(remaining), limit_gb: round2(limit) });
+  return sendJSON(res, 200, { ok: true, used_gb: round2(used), remaining_gb: round2(remaining), limit_gb: round2(limit), keys: entries.map((e) => ({ index: e.index, used_gb: e.used === null ? null : round2(e.used), remaining_gb: e.remaining === null ? null : round2(e.remaining), limit_gb: round2(e.limit), exhausted: e.exhausted })) });
 }
 /* __VIDFETCH_BLOCK_END__ */
 async function apiRoute(req, res, urlPath) {
@@ -9411,6 +9468,20 @@ async function apiRoute(req, res, urlPath) {
     const u = await mvsepUsageList();
     return sendJSON(res, 200, { ok: true, provider: 'mvsep', date: u.date, dailyLimit: u.dailyLimit, keys: u.keys });
   }
+  // GET /api/admin/vidfetch-usage — admin key required. Live VidFetch
+  // quota per stored key for the Admin → API Keys display (owner order
+  // 2026-11-23 ~18:11: each key shows its own 1 GB, how much used,
+  // how much left, exhausted = red). One parallel /v1/usage call per
+  // key; keys are 1-based indexes only — key values are never returned.
+  // Served through the generic Admin usage path: loadGenericUsage calls
+  // /api/admin/<id>-usage for providers missing from /api/admin/usage.
+  if (req.method === 'GET' && urlPath === '/api/admin/vidfetch-usage') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    const entries = await vidfetchUsagePerKey();
+    if (!entries) return sendJSON(res, 200, { ok: false, error: VIDFETCH_NO_KEY_ERROR });
+    return sendJSON(res, 200, { ok: true, provider: 'vidfetch', keys: vidfetchAdminUsageKeys(entries) });
+  }
   // GET /api/admin/suno-balance — admin key required. Live Suno credit
   // balance per stored Suno key for the Admin → API Keys display:
   // GET {endpoint}/api/v1/generate/credit (sunoapi.org) answers
@@ -10484,6 +10555,13 @@ async function apiRoute(req, res, urlPath) {
         if (r.status === 401 || r.status === 403) return blockedMsg(r.status);
         if (r.status === 429) return { status: 'error', message: 'Rate limit (HTTP 429) — សាកល្បងម្តងទៀតពេលក្រោយ' };
         return { status: 'error', message: 'Agnes AI ឆ្លើយ HTTP ' + r.status };
+      }
+      if (p === 'vidfetch') {
+        // GET /v1/usage with the key: 200 → ok unless the remaining
+        // quota is 0 (blocked/exhausted); 402 → blocked (quota);
+        // 401/403 → blocked (bad key); 429 → error (rate limit).
+        // The Admin dots + kc-blocked row styling come from this.
+        return await vidfetchTestKey(key);
       }
       if (p === 'tavus') {
         const r = await fetch('https://tavusapi.com/v2/replicas', { headers: { 'x-api-key': key }, signal: AbortSignal.timeout(timeoutMs) });
