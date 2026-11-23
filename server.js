@@ -3847,23 +3847,29 @@ async function mvsepCacheLoad() {
 async function mvsepCacheSave() {
   try { await saveKvDoc('mvsep-cache', _mvsepCache, 'mvsep-cache.json'); } catch (e) {}
 }
-function mvsepCacheKey(audioUrl) {
-  return crypto.createHash('sha256').update(String(audioUrl)).digest('hex');
+function mvsepCacheKey(audioUrl, mode) {
+  // Mode-aware: a Vocal Remover job must NEVER hit the 6-stem Studio
+  // cache for the same song (and vice versa). Mode '' keeps the legacy
+  // hash, so every cached 6-stem job stays valid; 'vr2'/'vr4' are the
+  // Vocal Remover models. (A VR 6-stem job shares the Studio cache —
+  // same model, same audio — and is filtered by locks at response time.)
+  const suf = (mode === 'vr2') ? '|vr2' : (mode === 'vr4') ? '|vr4' : '';
+  return crypto.createHash('sha256').update(String(audioUrl) + suf).digest('hex');
 }
-async function mvsepCacheGet(audioUrl) {
+async function mvsepCacheGet(audioUrl, mode) {
   try {
     const c = await mvsepCacheLoad();
-    const e = c.entries[mvsepCacheKey(audioUrl)];
+    const e = c.entries[mvsepCacheKey(audioUrl, mode)];
     if (!e || typeof e.hash !== 'string' || !e.hash) return '';
     if (!e.savedAt || (Date.now() - Number(e.savedAt)) > MVSEP_CACHE_TTL_MS) return '';
     return e.hash;
   } catch (err) { return ''; }
 }
-async function mvsepCachePut(audioUrl, hash) {
+async function mvsepCachePut(audioUrl, hash, mode) {
   try {
     if (!hash) return;
     const c = await mvsepCacheLoad();
-    c.entries[mvsepCacheKey(audioUrl)] = { hash, savedAt: Date.now() };
+    c.entries[mvsepCacheKey(audioUrl, mode)] = { hash, savedAt: Date.now() };
     const keys = Object.keys(c.entries);
     if (keys.length > MVSEP_CACHE_MAX) {
       keys.sort((a, b) => (c.entries[a].savedAt || 0) - (c.entries[b].savedAt || 0));
@@ -3871,6 +3877,54 @@ async function mvsepCachePut(audioUrl, hash) {
     }
     await mvsepCacheSave();
   } catch (err) {}
+}
+// ---- Vocal Remover locks (Admin-controlled, owner order 2026-11-23) ----
+async function vrLocksLoad() {
+  try {
+    const j = await loadKvDoc('vr-locks', null);
+    const l = (j && j.locked && typeof j.locked === 'object') ? j.locked : null;
+    if (!l) return Object.assign({}, VR_LOCKS_DEFAULT);
+    const out = {};
+    VR_STEMS.forEach(function (s) { out[s] = l[s] === true; });
+    return out;
+  } catch (e) { return Object.assign({}, VR_LOCKS_DEFAULT); }
+}
+async function vrLocksSave(locked) {
+  const out = {};
+  VR_STEMS.forEach(function (s) { out[s] = locked[s] === true; });
+  await saveKvDoc('vr-locks', { locked: out, at: Date.now() }, 'vr-locks.json');
+  return out;
+}
+// Pick the MVSEP model for the unlocked Vocal Remover stems — the
+// smallest model that covers them, so fewer stems = faster:
+// - piano/guitar unlocked -> 6-stem Demucs (sep 20, opt1 2)
+// - drums/bass unlocked -> 4-stem Demucs Fast (sep 20, opt1 1)
+// - else (only vocals/music) -> 2-stem BS Roformer (sep 40, opt1 81):
+//   vocals + instrumental, very fast.
+function vrModelFor(locked) {
+  if (!locked.piano || !locked.guitar) return { sepType: MVSEP_SEP_TYPE, opt1: MVSEP_MODEL_OPT, opt2: '', opt3: '', mode: '6' };
+  if (!locked.drums || !locked.bass) return { sepType: MVSEP_SEP_TYPE, opt1: MVSEP_MODEL_OPT_4_FAST, opt2: '', opt3: '', mode: '4' };
+  return { sepType: MVSEP_SEP_TYPE_2, opt1: MVSEP_MODEL_OPT_2, opt2: '2', opt3: '0', mode: '2' };
+}
+// Map MVSEP stems to Vocal Remover rows, showing only unlocked stems.
+// 'other' (4/6-stem models) fills the Music row — it is the remaining
+// music; 'instrumental' (2-stem model) is the Music row directly.
+// Locked stems come back as {name, locked:true} so the website can show
+// the lock instead of a download link.
+function vrRowsFromStems(stems, locked) {
+  const byName = {};
+  (stems || []).forEach(function (st) { if (st && st.name) byName[st.name] = st.url; });
+  const musicUrl = byName.music || byName.other || '';
+  const rows = [];
+  VR_STEMS.forEach(function (s) {
+    if (locked[s]) { rows.push({ name: s, locked: true }); return; }
+    let url = '';
+    if (s === 'music') url = musicUrl;
+    else url = byName[s] || '';
+    if (url) rows.push({ name: s, url: url });
+    // An unlocked stem the model did not produce is simply omitted.
+  });
+  return rows;
 }
 // ---- MVSEP stem separation (Demucs4 HT) ----
 // ---- MVSEP in-flight registry (mvsep-pending) ----
@@ -3921,25 +3975,27 @@ function mvsepPendingPrune(c) {
   }
   return changed;
 }
-async function mvsepPendingPut(audioUrl, hash) {
+async function mvsepPendingPut(audioUrl, hash, extra) {
   try {
     if (!hash) return;
     const c = await mvsepPendingLoad();
-    c.entries[hash] = { hash, audioUrl: String(audioUrl || ''), createdAt: Date.now(), status: 'processing' };
+    const ex = extra || {};
+    c.entries[hash] = { hash, audioUrl: String(audioUrl || ''), createdAt: Date.now(), status: 'processing', mode: ex.mode || '', paid6: !!ex.paid6, email: ex.email || '' };
     mvsepPendingPrune(c);
     await mvsepPendingSave();
   } catch (e) {}
 }
-async function mvsepPendingGetByAudio(audioUrl) {
-  // Live in-flight hash for this song, or '' — a cancelled or stale
-  // (>30 min) entry is not live.
+async function mvsepPendingGetByAudio(audioUrl, mode) {
+  // Live in-flight hash for this song AND mode, or '' — a cancelled or
+  // stale (>30 min) entry is not live. A Vocal Remover job must never
+  // resume a Studio job for the same song (or vice versa).
   try {
     const c = await mvsepPendingLoad();
     if (mvsepPendingPrune(c)) await mvsepPendingSave();
-    const key = mvsepCacheKey(audioUrl);
+    const key = mvsepCacheKey(audioUrl, mode);
     for (const h of Object.keys(c.entries)) {
       const e = c.entries[h];
-      if (e && e.status === 'processing' && mvsepCacheKey(e.audioUrl || '') === key) return e.hash;
+      if (e && e.status === 'processing' && mvsepCacheKey(e.audioUrl || '', e.mode || '') === key) return e.hash;
     }
     return '';
   } catch (e) { return ''; }
@@ -3965,7 +4021,7 @@ async function mvsepPendingCancel(hash) {
     e.status = 'cancelled';
     e.cancelledAt = Date.now();
     await mvsepPendingSave();
-    try { _mvsepHashAudio.delete(hash); _mvsepHashKey.delete(hash); } catch (err) {}
+    try { _mvsepHashAudio.delete(hash); _mvsepHashKey.delete(hash); _mvsepHashMode.delete(hash); } catch (err) {}
     return true;
   } catch (e) { return false; }
 }
@@ -3993,9 +4049,20 @@ const MVSEP_CREATE_URL = 'https://mvsep.com/api/separation/create';
 const MVSEP_GET_URL = 'https://mvsep.com/api/separation/get';
 const MVSEP_SEP_TYPE = 20;
 const MVSEP_MODEL_OPT = 2; // htdemucs_6s — 6 stems: vocals, drums, bass, other, piano, guitar (owner asked for 6, not 4; 8 is not available in one MVSEP call)
+const MVSEP_MODEL_OPT_4_FAST = 1; // htdemucs (Good Quality, Fast) — 4 stems: vocals, drums, bass, other
+const MVSEP_SEP_TYPE_2 = 40; // BS Roformer (vocals, instrumental) — the Vocal Remover model: voice + music only, very fast
+const MVSEP_MODEL_OPT_2 = 81; // BS Roformer ver 2025.07 (default) — 2 stems: vocals, instrumental
+const VR_COST = 6; // Vocal Remover: 6 SONG credits per fresh split after the 2 free uses — from the user's own MovAi account, NEVER Suno credits
+// Vocal Remover rows, in Admin lock order. 'music' = the instrumental
+// (2-stem model) or the 'other' stem (4/6-stem models) — the music.
+const VR_STEMS = ['vocals', 'music', 'drums', 'bass', 'piano', 'guitar'];
+// Default locks (owner order 2026-11-23): lock 4 (drums/bass/piano/
+// guitar) -> only vocals + music show, 2-stem model, very fast.
+// locked=true means the stem is locked (not split/shown).
+const VR_LOCKS_DEFAULT = { vocals: false, music: false, drums: true, bass: true, piano: true, guitar: true };
 const MVSEP_POLL_INTERVAL_MS = 5000; // 5s — detects a finished separation sooner (owner: split takes 2+ min, make it faster where possible)
 const MVSEP_POLL_TIMEOUT_MS = 240000; // 4 min server-side; the Studio resumes longer jobs via /api/studio/separate/status
-const MVSEP_STEM_ORDER = ['vocals', 'drums', 'bass', 'other', 'piano', 'guitar'];
+const MVSEP_STEM_ORDER = ['vocals', 'music', 'drums', 'bass', 'other', 'piano', 'guitar'];
 // hash -> key value that created it (in-memory only; used to count a
 // separation against the right key when it finishes via the status
 // endpoint after a poll timeout).
@@ -4004,6 +4071,10 @@ const _mvsepHashKey = new Map();
 // endpoint cache a separation that finished via resume, so a later
 // re-tap reuses the finished job instead of creating a duplicate one).
 const _mvsepHashAudio = new Map();
+// hash -> cache-mode string ('' for the 6-stem Studio, 'vr2' / 'vr4'
+// for Vocal Remover jobs). In-memory only; lets the status endpoint
+// cache a finished job under the right model key.
+const _mvsepHashMode = new Map();
 // Hashes already counted, so one separation is never counted twice (e.g.
 // if the Studio checks the status of a separation that already succeeded
 // through /api/studio/separate). In-memory only; capped so it cannot
@@ -4013,7 +4084,7 @@ function mvsepStemNameFromFile(download) {
   const base = String(download || '').toLowerCase().replace(/\\+/g, '/').split('/').pop().replace(/\.[a-z0-9]+$/, '');
   // Filenames look like "vocals.mp3" or "<title>_vocals.mp3" — match the stem keyword inside.
   for (const name of MVSEP_STEM_ORDER) { if (base.includes(name)) return name; }
-  if (base.includes('instrumental') || base.includes('instrum') || base.includes('music')) return 'other';
+  if (base.includes('instrumental') || base.includes('instrum') || base.includes('music')) return 'music';
   return base ? base.slice(0, 40) : 'other';
 }
 function mvsepParseStems(files) {
@@ -4087,7 +4158,7 @@ function mvsepQuotaErr(detail, httpStatus) {
   // rotate-to-next-key error (the key's 50/day is spent).
   return rotErr('MVSEP quota exceeded — daily limit 50 reached for this key' + (detail ? ': ' + String(detail).slice(0, 120) : ''), httpStatus || 429);
 }
-async function mvsepCreateSeparation(keyValue, audioUrl) {
+async function mvsepCreateSeparation(keyValue, audioUrl, sep) {
   // Upload the audio FILE itself (`audiofile`), exactly like the official
   // MVSEP API example. The `url` remote-fetch parameter returned HTTP 400
   // for every URL we tried (public MP3, MovAi proxy MP3, Cloudinary MP3),
@@ -4104,9 +4175,11 @@ async function mvsepCreateSeparation(keyValue, audioUrl) {
   const fd = new FormData();
   fd.append('api_token', keyValue);
   fd.append('audiofile', new Blob([buf], { type: ct }), fname);
-  fd.append('sep_type', String(MVSEP_SEP_TYPE));
-  fd.append('add_opt1', String(MVSEP_MODEL_OPT));
-  fd.append('add_opt2', '');
+  const _sep = sep || {};
+  fd.append('sep_type', String(typeof _sep.sepType === 'number' ? _sep.sepType : MVSEP_SEP_TYPE));
+  fd.append('add_opt1', String(typeof _sep.opt1 === 'number' ? _sep.opt1 : MVSEP_MODEL_OPT));
+  fd.append('add_opt2', String(typeof _sep.opt2 === 'string' ? _sep.opt2 : ''));
+  if (typeof _sep.opt3 === 'string' && _sep.opt3 !== '') fd.append('add_opt3', _sep.opt3);
   fd.append('output_format', '0');
   fd.append('is_demo', '0');
   const r = await fetch(MVSEP_CREATE_URL, { method: 'POST', body: fd, headers: { 'User-Agent': 'MovAi/1.0 (https://movai-1.onrender.com)' }, signal: AbortSignal.timeout(120000) });
@@ -4151,7 +4224,7 @@ async function mvsepGetSeparation(hash) {
   }
   return { done: false };
 }
-async function mvsepSeparateWithKey(keyValue, audioUrl, maxWaitMs) {
+async function mvsepSeparateWithKey(keyValue, audioUrl, maxWaitMs, sep, pendingExtra) {
   // The Studio POST waits at most maxWaitMs, then hands the client the
   // hash so it can poll /status with a visible check count — a long
   // blind wait is why the owner could not tell whether a split was
@@ -4160,16 +4233,19 @@ async function mvsepSeparateWithKey(keyValue, audioUrl, maxWaitMs) {
   // Create + poll with ONE key. Only the create step can trigger key
   // rotation (quota errors); a poll timeout / failure is a plain error so
   // a second separation is never created (and no second quota spent).
-  const hash = await mvsepCreateSeparation(keyValue, audioUrl);
+  const hash = await mvsepCreateSeparation(keyValue, audioUrl, sep);
   // Remember which key created this hash (in-memory) so a later status
   // check can count the separation against the right key.
-  try { _mvsepHashKey.set(hash, keyValue); _mvsepHashAudio.set(hash, audioUrl); } catch (e) {}
+  const _cmode = (sep && sep.mode === '2') ? 'vr2' : (sep && sep.mode === '4') ? 'vr4' : '';
+  try { _mvsepHashKey.set(hash, keyValue); _mvsepHashAudio.set(hash, audioUrl); _mvsepHashMode.set(hash, _cmode); } catch (e) {}
   // Record the in-flight job so a re-tap resumes THIS hash instead of
   // creating a duplicate separation on another key.
-  await mvsepPendingPut(audioUrl, hash);
+  await mvsepPendingPut(audioUrl, hash, Object.assign({ mode: _cmode }, pendingExtra || {}));
   const deadline = Date.now() + _waitMs;
   for (;;) {
-    const res = await mvsepGetSeparation(hash);
+    let res;
+    try { res = await mvsepGetSeparation(hash); }
+    catch (e) { e.hash = hash; throw e; } // so the caller can refund / un-pend a job MVSEP failed
     if (res.done) return { hash, stems: res.stems, keyUsed: keyValue };
     if (Date.now() >= deadline) {
       const e = new Error('MVSEP separation still processing after ' + Math.round(_waitMs / 1000) + ' seconds');
@@ -5613,6 +5689,57 @@ async function apiRoute(req, res, urlPath) {
         }
         return sendJSON(res, 200, { ok: false, error: 'Provider មិនស្គាល់ទេ' });
       } catch (e) { return sendJSON(res, 200, { ok: false, error: 'សួរព័ត៌មានមិនបានទេ៖ ' + (e && e.message ? e.message : 'unknown') }); }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+
+  // POST /api/gen/image/edit — {email, imageUrl, prompt} — chat photo
+  // editor (owner order 2026-11-23): keep the SAME person/photo, only
+  // change the background. Magic Hour AI Image Editor
+  // (POST /v1/ai-image-editor, assets.image_file_paths, style.prompt)
+  // with nano-banana-2.1 — the edit model that preserves the person
+  // while replacing the background. 50 Media Credits, deducted FIRST
+  // (after the client's Approve tap) and refunded if Magic Hour fails.
+  // Returns {ok:true, jobId, provider:'magichour', model} — the client
+  // polls the existing /api/gen/image/status (magichour image-projects).
+  if (req.method === 'POST' && urlPath === '/api/gen/image/edit') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      try {
+        const email = normEmail(body.email || '');
+        if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនីជាមុនសិន · Please sign in first', needLogin: true });
+        const _gateErr = await genFairnessGate(email, 'magichour');
+        if (_gateErr) return sendJSON(res, 200, { ok: false, error: _gateErr });
+        const _blkErr = await genBlockedCheck(email, req);
+        if (_blkErr) return sendJSON(res, 200, { ok: false, error: _blkErr });
+        const imageUrl = String(body.imageUrl || '').trim();
+        if (!/^https?:\/\//i.test(imageUrl)) return sendJSON(res, 200, { ok: false, error: 'មិនមានរូបសម្រាប់កែទេ — សូមអាប់ឡូតរូបជាមុនសិន · No photo to edit — please upload a photo first' });
+        let bg = String(body.prompt || '').trim().slice(0, 500);
+        if (!bg) return sendJSON(res, 200, { ok: false, error: 'សូមសរសេរផ្ទៃខាងក្រោយដែលចង់បាន · Please describe the new background' });
+        if (/[^\x00-\x7F]/.test(bg)) {
+          const _en = await translateImgPromptToEnglish(bg);
+          if (_en) bg = _en.slice(0, 500);
+        }
+        const editPrompt = 'Keep the exact same person, face, clothes and pose from the photo unchanged. Only replace the background with: ' + bg + '. Photorealistic, natural lighting, seamless blend, highly detailed, sharp focus.';
+        const EDIT_MODEL = 'nano-banana-2.1';
+        const EDIT_COST = 50;
+        const _ded = await deductForGeneration(email, EDIT_COST, 0, 'image:edit:' + EDIT_MODEL);
+        if (!_ded.ok) return sendJSON(res, 200, { ok: false, error: _ded.error || 'Credit មិនគ្រប់ទេ', needBuy: true, kind: 'media', balance: _ded.balance, cost: EDIT_COST });
+        let out;
+        try {
+          out = await withProviderKeyRotation('magichour', async (k) => {
+            const r = await fetch('https://api.magichour.ai/v1/ai-image-editor', { method: 'POST', headers: { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'MovAi photo edit', model: EDIT_MODEL, image_count: 1, aspect_ratio: 'auto', resolution: '1k', style: { prompt: editPrompt }, assets: { image_file_paths: [imageUrl] } }), signal: AbortSignal.timeout(60000) });
+            const j = await r.json().catch(() => null);
+            const id = j && j.id;
+            if (id) return { jobId: id };
+            throw rotErr('Magic Hour: ' + genErrText(j, 'HTTP ' + r.status), r.status);
+          });
+        } catch (e) {
+          await refundForGeneration(email, EDIT_COST, 0, 'image:edit:' + EDIT_MODEL + ' failed');
+          if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Magic Hour Key ទេ' });
+          return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Magic Hour: request failed' });
+        }
+        return sendJSON(res, 200, { ok: true, jobId: out.jobId, provider: 'magichour', model: EDIT_MODEL, imageCost: EDIT_COST, credits: _ded.credits, songCredits: _ded.songCredits });
+      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'កែរូបមិនបានទេ៖ ' + (e && e.message ? e.message : 'unknown') }); }
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
@@ -7628,10 +7755,13 @@ async function apiRoute(req, res, urlPath) {
   // Cloudinary section (after the /api/gen/song/mp3 endpoint), because
   // it calls cloudinaryStoreSong — helpers defined after this point
   // would be in TDZ from here (apiRoute returns at the first match).
-  // POST /api/studio/separate — {email, audioUrl, songTitle?} — requires logged-in email.
-  // MVSEP Demucs4 HT stem separation for MOVAI STUDIO: creates a separation
-  // (vocals/drums/bass/other) for the song's audio URL, polls MVSEP until it
-  // finishes, and returns {ok, stems:[{name,url}], hash}. Keys rotate on
+  // POST /api/studio/separate — {email, audioUrl, songTitle?, stems?} — requires logged-in email.
+  // MVSEP stem separation for MOVAI STUDIO and the Vocal Remover:
+  // creates a separation for the song's audio URL, polls MVSEP until it
+  // finishes, and returns {ok, stems:[{name,url}], hash}. stems: 2 =
+  // Vocal Remover (Admin locks pick the model: 2/4/6 stems, 2 free
+  // then 6 song credits); anything else = 6-stem Studio (old
+  // package/free/bonus allowance). Keys rotate on
   // daily-limit errors (50/day/key); if every key is exhausted returns
   // error 'mvsep_limit'. If the job is still processing after the
   // server-side poll timeout, returns error 'mvsep_timeout' WITH the hash
@@ -7646,6 +7776,14 @@ async function apiRoute(req, res, urlPath) {
         const audioUrl = body && typeof body.audioUrl === 'string' ? body.audioUrl.trim() : '';
         if (!audioUrl || !/^https?:\/\//i.test(audioUrl)) return sendJSON(res, 200, { ok: false, error: 'មិនមាន Link បទចម្រៀងទេ · No song audio URL' });
         const songTitle = body && typeof body.songTitle === 'string' ? body.songTitle.trim().slice(0, 200) : '';
+        // Vocal Remover (My Songs ⋮ menu) asks for 2 sounds: {stems: 2}.
+        // Anything else (including no stems field) keeps the 6-stem Studio.
+        const vr = body && (body.stems === 2 || body.stems === '2');
+        const _locks = vr ? await vrLocksLoad() : null;
+        const _model = vr ? vrModelFor(_locks) : null;
+        // Cache-mode: 'vr2'/'vr4' for Vocal Remover jobs; '' shares the
+        // Studio cache for VR 6-stem jobs (same model, same audio).
+        const _vrMode = vr ? ((_model.mode === '2') ? 'vr2' : (_model.mode === '4') ? 'vr4' : '') : '';
         // Account check first (unknown email -> no_account). The
         // allowance itself is consumed only for a FRESH separation
         // below — a cached re-split or a resume of a running job
@@ -7660,12 +7798,12 @@ async function apiRoute(req, res, urlPath) {
         // job is still processing, hand its hash back so the Studio
         // resumes via the status endpoint (no second job, no extra quota).
         // Any failure falls through to a fresh separation below.
-        const cachedHash = await mvsepCacheGet(audioUrl);
+        const cachedHash = await mvsepCacheGet(audioUrl, _vrMode);
         if (cachedHash) {
           try {
             const r = await mvsepGetSeparation(cachedHash);
             if (r.done && r.stems && r.stems.length) {
-              return sendJSON(res, 200, { ok: true, provider: 'mvsep', hash: cachedHash, songTitle, stems: r.stems, cached: true });
+              return sendJSON(res, 200, { ok: true, provider: 'mvsep', hash: cachedHash, songTitle, stems: vr ? vrRowsFromStems(r.stems, _locks) : r.stems, cached: true });
             }
             return sendJSON(res, 200, { ok: false, error: 'mvsep_timeout', hash: cachedHash, message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
           } catch (e) { /* old job gone/failed — fall through to a fresh separation */ }
@@ -7675,7 +7813,7 @@ async function apiRoute(req, res, urlPath) {
         // Resume THAT hash instead of creating a duplicate job on
         // another key — a duplicate is what fanned one stuck song
         // across all 11 MVSEP queues (2026-11-19).
-        const pendingHash = await mvsepPendingGetByAudio(audioUrl);
+        const pendingHash = await mvsepPendingGetByAudio(audioUrl, _vrMode);
         if (pendingHash) {
           return sendJSON(res, 200, { ok: false, error: 'mvsep_timeout', hash: pendingHash, message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
         }
@@ -7687,7 +7825,18 @@ async function apiRoute(req, res, urlPath) {
         // Package allowance is spendable ONLY while a package is
         // active. An expired package's remaining vsLeft is LOST —
         // never spent; go straight to the lifetime Free 2 instead.
-        if (hasActivePackage(_vsU) && (_vsU.vsUnlimited || featurePkgLeft(_vsU, 'vsLeft') > 0)) { if (!_vsU.vsUnlimited) _vsU.vsLeft = featurePkgLeft(_vsU, 'vsLeft') - 1; }
+        // Vocal Remover (owner order 2026-11-23): 2 free uses,
+        // then 6 SONG credits from the user's own MovAi account (the
+        // credits from the package they bought) — NEVER Suno credits.
+        // The 6-stem Studio keeps the old package/free/bonus allowance.
+        let paid6 = false;
+        if (vr && featureFreeUsed(_vsU, 'freeVsUsed') < FEATURE_FREE_LIMIT) { _vsU.freeVsUsed = featureFreeUsed(_vsU, 'freeVsUsed') + 1; }
+        else if (vr) {
+          const _ded = await deductForGeneration(email, 0, VR_COST, 'song:vocal-remover');
+          if (!_ded.ok) return sendJSON(res, 200, { ok: false, error: _ded.error || 'Song Credit មិនគ្រប់ទេ', needBuy: true, kind: 'song', balance: _ded.balance, cost: VR_COST });
+          paid6 = true;
+        }
+        else if (hasActivePackage(_vsU) && (_vsU.vsUnlimited || featurePkgLeft(_vsU, 'vsLeft') > 0)) { if (!_vsU.vsUnlimited) _vsU.vsLeft = featurePkgLeft(_vsU, 'vsLeft') - 1; }
         else if (featureFreeUsed(_vsU, 'freeVsUsed') < FEATURE_FREE_LIMIT) { _vsU.freeVsUsed = featureFreeUsed(_vsU, 'freeVsUsed') + 1; }
         else if (featureBonus(_vsU, 'bonusVs') > 0) { _vsU.bonusVs = featureBonus(_vsU, 'bonusVs') - 1; }
         else return sendJSON(res, 200, { ok: false, error: 'vs_out', message: 'You have used your 2 free Vocal Studio splits and have no allowance left — please buy a song package to continue.' });
@@ -7699,12 +7848,18 @@ async function apiRoute(req, res, urlPath) {
           out = await withProviderKeyRotation('mvsep', async (k) => {
             // 30s max in the POST: after that the client polls /status
             // with a live check count, so a long split never looks stuck.
-            const r = await mvsepSeparateWithKey(k, audioUrl, 30000);
+            const r = await mvsepSeparateWithKey(k, audioUrl, 30000, vr ? _model : null, { paid6: paid6, email: email });
             return { hash: r.hash, stems: r.stems, keyUsed: k };
           });
         } catch (e) {
+          if (e && e.code === 'mvsep_timeout') return sendJSON(res, 200, Object.assign({ ok: false, error: 'mvsep_timeout', hash: e.hash || '', message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } }, vr ? { charged: paid6 ? VR_COST : 0, freeLeft: Math.max(0, FEATURE_FREE_LIMIT - featureFreeUsed(_vsU, 'freeVsUsed')) } : {}));
+          // A paid Vocal Remover job died (no key, create failed, or
+          // MVSEP failed it during the 30s wait) — refund the 6 credits
+          // once and un-pend the dead hash so a re-tap can start fresh.
+          // A timeout means the job is ALIVE on MVSEP (handled above) —
+          // no refund for that.
+          if (paid6) { try { await refundForGeneration(email, 0, VR_COST, 'song:vocal-remover failed'); if (e && e.hash) await mvsepPendingRemove(e.hash); } catch (e2) {} }
           if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'mvsep_no_key', message: { km: 'Admin មិនទាន់ដាក់ API Key សម្រាប់បំបែកបទទេ', en: 'Admin has not added an API key for splitting yet' } });
-          if (e && e.code === 'mvsep_timeout') return sendJSON(res, 200, { ok: false, error: 'mvsep_timeout', hash: e.hash || '', message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
           if (e && e.code === 'mvsep_queue_busy') return sendJSON(res, 200, { ok: false, error: 'mvsep_busy', message: { km: 'MovAi កំពុងបំបែកបទមុន — សូមរង់ចាំបន្តិច (ប៉ុន្មាននាទី) ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still processing a previous split — please wait a few minutes and try Split (AI) again' }, debugAttempts: (e && e.attempts) || undefined });
           if (e && /quota exceeded/i.test(String(e.message || ''))) return sendJSON(res, 200, { ok: false, error: 'mvsep_limit', message: { km: 'MovAi ដល់កំណត់ 50 បទ/ថ្ងៃ លើ Key ទាំងអស់ហើយ — សូមសាកល្បងម្តងទៀតនៅថ្ងៃស្អែក', en: 'MovAi daily limit of 50 songs/day reached on all keys — please try again tomorrow' }, debugAttempts: (e && e.attempts) || undefined });
           return sendJSON(res, 200, { ok: false, error: String((e && e.message) || 'MovAi: request failed').replace(/^MVSEP:\s*/, 'MovAi: ') });
@@ -7713,8 +7868,8 @@ async function apiRoute(req, res, urlPath) {
         await recordMvsepSeparation(out.keyUsed, out.hash);
         await mvsepPendingRemove(out.hash);
         // Remember this song's separation so a later re-split returns in ~1-2s from the cache instead of ~2 min.
-        await mvsepCachePut(audioUrl, out.hash);
-        return sendJSON(res, 200, { ok: true, provider: 'mvsep', hash: out.hash, songTitle, stems: out.stems });
+        await mvsepCachePut(audioUrl, out.hash, _vrMode);
+        return sendJSON(res, 200, Object.assign({ ok: true, provider: 'mvsep', hash: out.hash, songTitle, stems: vr ? vrRowsFromStems(out.stems, _locks) : out.stems }, vr ? { charged: paid6 ? VR_COST : 0, freeLeft: Math.max(0, FEATURE_FREE_LIMIT - featureFreeUsed(_vsU, 'freeVsUsed')) } : {}));
       } catch (e) { return sendJSON(res, 200, { ok: false, error: 'MovAi: ' + (e && e.message ? String(e.message).replace(/^MVSEP:\s*/, '').slice(0, 200) : 'request failed') }); }
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
@@ -7773,6 +7928,17 @@ async function apiRoute(req, res, urlPath) {
         try {
           r = await mvsepGetSeparation(hash);
         } catch (e) {
+          // A paid Vocal Remover job that MVSEP itself failed: refund
+          // the 6 credits ONCE (kv marker, like the 12-stem
+          // 'stem-refund:' marker). Transient errors (bad response,
+          // network) are not failures — no refund, the job may still
+          // be processing.
+          try {
+            if (_pend && _pend.paid6 && _pend.email && String((e && e.message) || '').indexOf('MVSEP separation failed') === 0 && !(await loadKvDoc('vr-refund:' + hash, null))) {
+              await refundForGeneration(_pend.email, 0, VR_COST, 'song:vocal-remover failed');
+              await saveKvDoc('vr-refund:' + hash, { email: _pend.email, hash: hash, at: Date.now() }, 'vr-refund.json');
+            }
+          } catch (e2) {}
           return sendJSON(res, 200, { ok: false, error: 'mvsep_not_found', hash, message: { km: 'រក Separation នេះមិនឃើញទេ — វាអាចបរាជ័យ ឬផុតកំណត់ហើយ', en: 'Separation not found — it may have failed or expired' } });
         }
         if (r.done) {
@@ -7783,7 +7949,18 @@ async function apiRoute(req, res, urlPath) {
           // same song reuses this finished job instead of creating a
           // duplicate separation on another key.
           const _au = _mvsepHashAudio.get(hash);
-          if (_au) await mvsepCachePut(_au, hash);
+          // Model-aware: only cache when the mode is known ('vr2' /
+          // 'vr4' / ''), so a Vocal Remover job can never poison the
+          // Studio cache (or vice versa). Unknown mode skips the cache
+          // put (loses a cache entry, never a wrong one).
+          const _pm = (_pend && typeof _pend.mode === 'string') ? _pend.mode : _mvsepHashMode.get(hash);
+          if (_au && typeof _pm === 'string') await mvsepCachePut(_au, hash, _pm);
+          // A Vocal Remover job returns VR rows (unlocked stems + locked
+          // rows) under the CURRENT Admin locks, not raw MVSEP stems.
+          if (_pend && _pend.mode && _pend.mode.indexOf('vr') === 0) {
+            const _locks2 = await vrLocksLoad();
+            return sendJSON(res, 200, { ok: true, done: true, hash, stems: vrRowsFromStems(r.stems, _locks2) });
+          }
           return sendJSON(res, 200, { ok: true, done: true, hash, stems: r.stems });
         }
         return sendJSON(res, 200, { ok: true, done: false, status: 'processing', hash });
@@ -8622,6 +8799,26 @@ async function apiRoute(req, res, urlPath) {
       if (!body || typeof body.enabled !== 'boolean') return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ enabled: true/false' });
       const out = await saveSettings(Object.assign(await loadSettings(), { gift50: body.enabled }));
       return sendJSON(res, 200, { ok: true, enabled: out.gift50 === true });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  // GET /api/admin/vr-locks — admin key required. Reads the Vocal
+  // Remover stem locks (default: vocals+music unlocked, drums/bass/
+  // piano/guitar locked -> only voice + music show, 2-stem model).
+  // POST /api/admin/vr-locks {locked:{vocals,music,drums,bass,piano,
+  // guitar}} sets them. The Admin app has a Vocal Remover section for it.
+  if (req.method === 'GET' && urlPath === '/api/admin/vr-locks') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    return sendJSON(res, 200, { ok: true, locked: await vrLocksLoad() });
+  }
+  if (req.method === 'POST' && urlPath === '/api/admin/vr-locks') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      if (!body || !body.locked || typeof body.locked !== 'object' || Array.isArray(body.locked)) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ locked: {vocals, music, drums, bass, piano, guitar}' });
+      const out = await vrLocksSave(body.locked);
+      return sendJSON(res, 200, { ok: true, locked: out });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
@@ -11622,6 +11819,48 @@ async function apiRoute(req, res, urlPath) {
     _cloudQueue = run.catch(() => {});
     return run;
   }
+
+  // Image upload for the chat photo editor (owner order 2026-11-23):
+  // stores a base64 image on Cloudinary (resource_type 'image') and
+  // returns its permanent public URL, which Magic Hour's AI Image
+  // Editor fetches as image_file_paths. Same account rotation +
+  // serial queue as cloudinaryStoreSong. Returns {publicId, url} or
+  // null when every account failed.
+  async function cloudinaryStoreImage(dataUri, publicId) {
+    const candidates = await cloudinaryCandidates();
+    if (!candidates.length) return null;
+    const rot = await loadCloudinaryRotation();
+    let start = 0;
+    if (rot.lastAccountId) {
+      const li = candidates.findIndex((x) => x.id === rot.lastAccountId);
+      if (li >= 0) start = (li + 1) % candidates.length;
+    }
+    const ordered = candidates.slice(start).concat(candidates.slice(0, start));
+    const run = _cloudQueue.then(async () => {
+      for (const a of ordered) {
+        try {
+          const c = cloudinaryConfigFor(a);
+          if (!c) continue;
+          const res = await Promise.race([c.uploader.upload(dataUri, { resource_type: 'image', public_id: publicId, overwrite: false }), new Promise(function(_, rej) { setTimeout(function() { rej(new Error('cloudinary upload timeout')); }, 120000); })]);
+          const url = res && res.secure_url;
+          if (!url) continue;
+          await saveCloudinaryRotation({ lastAccountId: a.id, updatedAt: new Date().toISOString() });
+          return { publicId: res.public_id, url, accountId: a.id };
+        } catch (e) {
+          const msg = String((e && e.message) || e);
+          console.error('[cloudinary] image upload via ' + (a.label || a.cloudName) + ' failed:', msg.slice(0, 200));
+          if (/already exists/i.test(msg)) {
+            const c2 = cloudinaryConfigFor(a);
+            const url2 = c2 ? c2.url(publicId, { resource_type: 'image', secure: true }) : null;
+            if (url2) return { publicId, url: url2, accountId: a.id };
+          }
+        }
+      }
+      return null;
+    });
+    _cloudQueue = run.catch(() => {});
+    return run;
+  }
   // ---- PERMANENT SONG URLs (owner order 2026-11-18): a song's canonical
   // audio URL must be a PERMANENT Cloudinary URL — never a Magic Hour
   // signed URL (expires after 24h) and never a bare proxy /uploads/ URL.
@@ -12623,7 +12862,75 @@ async function apiRoute(req, res, urlPath) {
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
+  // POST /api/studio/upload — {email, filename, data(base64)}.
+  // Uploads an EXTERNAL MP3 (or wav/flac/m4a) for splitting — the file
+  // the user picks in My Songs > ⋮ > Files MP3. Same storage as the
+  // cover upload (Cloudinary, permanent public MP3 URL) so both the
+  // Vocal Remover (MVSEP downloads the URL) and the 12-stem Suno split
+  // (takes audioUrl) can use it. Max 20 MB. No credit is charged here
+  // — the split itself charges (2 free, then 6 credits for Vocal
+  // Remover; 50 for Split 12).
+  if (req.method === 'POST' && urlPath === '/api/studio/upload') {
+    readJSONBody(req, 40 * 1024 * 1024).then(async (body) => {
+      try {
+        const email = normEmail(body.email || '');
+        if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនីជាមុនសិន' });
+        const filename = String(body.filename || 'song.mp3');
+        const ext = uploadSafeExt('audio', filename);
+        if (!ext) return sendJSON(res, 200, { ok: false, error: 'ឯកសារនេះមិនមែនជា Audio ទេ — សូមប្រើ mp3, wav, flac ឬ m4a · Audio only — mp3, wav, flac or m4a' });
+        const b64 = String(body.data || '').replace(/\s/g, '');
+        if (!b64 || !/^[A-Za-z0-9+/=]+$/.test(b64)) return sendJSON(res, 200, { ok: false, error: 'ទិន្នន័យឯកសារមិនត្រឹមត្រូវទេ · Bad file data' });
+        let buf;
+        try { buf = Buffer.from(b64, 'base64'); } catch (e) { return sendJSON(res, 200, { ok: false, error: 'ឯកសារខូច · Bad file data' }); }
+        if (!buf.length || buf.length > 20 * 1024 * 1024) return sendJSON(res, 200, { ok: false, error: 'ឯកសារធំពេក — អតិបរមា 20 MB · File too big — max 20 MB' });
+        const safeName = 'split-' + Date.now().toString(36) + '-' + crypto.randomInt(100000, 999999) + ext;
+        const fpath = path.join(DATA_DIR, 'uploads', safeName);
+        try { fs.mkdirSync(path.join(DATA_DIR, 'uploads'), { recursive: true }); } catch (e) {}
+        fs.writeFileSync(fpath, buf);
+        const proto = req.headers && req.headers['x-forwarded-proto'] === 'http' ? 'http' : 'https';
+        const host = (req.headers && req.headers.host) || 'movai-proxy-dphl.onrender.com';
+        const pubUrl = proto + '://' + host + '/uploads/' + safeName;
+        const stored = await cloudinaryStoreSong(pubUrl, (filename || 'split').replace(/\.[^.]+$/, ''));
+        if (!stored || stored === 'gone' || !stored.mp3Url) {
+          try { fs.unlinkSync(fpath); } catch (e) {}
+          return sendJSON(res, 200, { ok: false, error: 'អាប់ឡូតបទមិនបានទេ — សូមព្យាយាមម្ដងទៀត · Upload failed — please try again' });
+        }
+        return sendJSON(res, 200, { ok: true, url: stored.mp3Url, name: safeName, size: buf.length });
+      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'អាប់ឡូតបទមិនបានទេ៖ ' + (e && e.message ? e.message : 'unknown') }); }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
 
+
+  // POST /api/gen/image/upload — {email, filename, data(base64)}.
+  // Uploads a photo picked in AI Chat for the photo editor (owner
+  // order 2026-11-23): stores it on Cloudinary and returns the
+  // permanent public URL, which POST /api/gen/image/edit sends to
+  // Magic Hour as the source image. Accepts jpg/jpeg/png/webp/gif,
+  // max 10 MB. No credit is charged here — the edit itself charges
+  // 50 Media Credits (nano-banana-2.1) with a confirm first.
+  if (req.method === 'POST' && urlPath === '/api/gen/image/upload') {
+    readJSONBody(req, 40 * 1024 * 1024).then(async (body) => {
+      try {
+        const email = normEmail(body.email || '');
+        if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនីជាមុនសិន' });
+        const filename = String(body.filename || 'photo.jpg');
+        const ext = uploadSafeExt('image', filename);
+        if (!ext) return sendJSON(res, 200, { ok: false, error: 'ឯកសារនេះមិនមែនជារូបភាពទេ — សូមប្រើ jpg, png, webp ឬ gif · Image only — jpg, png, webp or gif' });
+        const b64 = String(body.data || '').replace(/\s/g, '');
+        if (!b64 || !/^[A-Za-z0-9+/=]+$/.test(b64)) return sendJSON(res, 200, { ok: false, error: 'ទិន្នន័យឯកសារមិនត្រឹមត្រូវទេ · Bad file data' });
+        let buf;
+        try { buf = Buffer.from(b64, 'base64'); } catch (e) { return sendJSON(res, 200, { ok: false, error: 'ឯកសារខូច · Bad file data' }); }
+        if (!buf.length || buf.length > 10 * 1024 * 1024) return sendJSON(res, 200, { ok: false, error: 'រូបធំពេក — អតិបរមា 10 MB · File too big — max 10 MB' });
+        const publicId = 'movai/chat-edits/' + Date.now().toString(36) + '-' + crypto.randomInt(100000, 999999);
+        const mime = ext === '.jpg' || ext === '.jpeg' ? 'jpeg' : ext.slice(1);
+        const stored = await cloudinaryStoreImage('data:image/' + mime + ';base64,' + b64, publicId);
+        if (!stored || !stored.url) return sendJSON(res, 200, { ok: false, error: 'អាប់ឡូតរូបមិនបានទេ — សូមព្យាយាមម្ដងទៀត · Upload failed — please try again' });
+        return sendJSON(res, 200, { ok: true, url: stored.url, name: publicId, size: buf.length });
+      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'អាប់ឡូតរូបមិនបានទេ៖ ' + (e && e.message ? e.message : 'unknown') }); }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
   if (req.method === 'POST' && urlPath === '/api/public/upload') {
     const a = await adminKeyOk(req);
     if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
