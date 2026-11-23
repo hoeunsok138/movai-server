@@ -5306,6 +5306,46 @@ async function apiRoute(req, res, urlPath) {
   }
   // The server NEVER stores keys — no file, no env var, no log.
   // POST /api/gen/image — {provider:'cloudflare'|'gemini'|'hf', key, accountId, prompt, width, height}
+  // Stage 33 — watermark for FREE chat images (owner order 2026-11-23):
+  // every image the chat creates for free (Agnes / NovAI) carries the MovAi
+  // logo + "MovAi" name in the bottom-right corner, and the watermark stays
+  // in the file when it is downloaded. Paid Magic Hour images are NOT
+  // watermarked. The watermark is one pre-composited PNG hosted on the site;
+  // the image is stored on Cloudinary and the watermark is applied as a
+  // Cloudinary fetch-overlay at delivery time, so no image library is needed
+  // on the server. If anything fails, the original URL is returned unchanged.
+  const MOVAI_WATERMARK_URL = 'https://movai-78r6.onrender.com/movai-watermark.png';
+  function movaiWatermarkedUrl(cloudUrl) {
+    if (!cloudUrl || cloudUrl.indexOf('res.cloudinary.com/') === -1) return null;
+    if (cloudUrl.indexOf('/image/upload/l_fetch:') !== -1) return cloudUrl;
+    const b64 = Buffer.from(MOVAI_WATERMARK_URL).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const tr = 'l_fetch:' + b64 + ',w_180,g_south_east,x_12,y_12';
+    const i = cloudUrl.indexOf('/image/upload/');
+    if (i === -1) return null;
+    return cloudUrl.slice(0, i + 14) + tr + '/' + cloudUrl.slice(i + 14);
+  }
+  async function movaiWatermarkFreeImage(imageUrl) {
+    try {
+      if (!imageUrl || !/^https?:\/\//i.test(imageUrl)) return null;
+      const r = await fetch(imageUrl, { signal: AbortSignal.timeout(60000) });
+      if (!r.ok) return null;
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (!buf.length || buf.length > 15 * 1024 * 1024) return null;
+      const mime = (r.headers.get('content-type') || '').split(';')[0].trim();
+      if (mime && !/^image\//.test(mime)) return null;
+      const stored = await cloudinaryStoreImage('data:' + (mime || 'image/jpeg') + ';base64,' + buf.toString('base64'), 'movai/chat-wm/' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8));
+      if (!stored || !stored.url) return null;
+      const wm = movaiWatermarkedUrl(stored.url);
+      if (!wm) return null;
+      // Verify the transformed URL actually serves (the account must allow
+      // fetch overlays); otherwise fall back to the plain stored URL.
+      try {
+        const v = await fetch(wm, { method: 'GET', headers: { Range: 'bytes=0-1023' }, signal: AbortSignal.timeout(30000) });
+        if (!v.ok) return stored.url;
+      } catch (e) { return stored.url; }
+      return wm;
+    } catch (e) { console.error('[watermark] failed:', String((e && e.message) || e).slice(0, 200)); return null; }
+  }
   if (req.method === 'POST' && urlPath === '/api/gen/image') {
     const genCtx = { provider: '', email: '' };
     await wrapGenLog(res, 'image', genCtx);
@@ -5512,7 +5552,11 @@ async function apiRoute(req, res, urlPath) {
             if (_imgFree) await imgFreeRefund(body.email, body.isThumbnail === true);
             _imgFree = null;
           }
-          if (_autoOut.done) return sendJSON(res, 200, { ok: true, done: true, imageUrl: _autoOut.imageUrl, provider: _autoProv, model: _autoModel, imageModel: _autoModel, imgFree: _imgFree, imageCost: _autoCost, isTest: _autoProv === 'magichour' });
+          if (_autoOut.done) {
+            let _wmUrl = _autoOut.imageUrl;
+            if (_autoProv === 'agnes' || _autoProv === 'novai') { const _wm = await movaiWatermarkFreeImage(_autoOut.imageUrl); if (_wm) _wmUrl = _wm; }
+            return sendJSON(res, 200, { ok: true, done: true, imageUrl: _wmUrl, provider: _autoProv, model: _autoModel, imageModel: _autoModel, imgFree: _imgFree, imageCost: _autoCost, isTest: _autoProv === 'magichour' });
+          }
           return sendJSON(res, 200, { ok: true, jobId: _autoOut.jobId, provider: _autoProv, model: _autoModel, imageModel: _autoModel, imgFree: _imgFree, imageCost: _autoCost, credits: _autoCredits, songCredits: _autoSongCredits, isTest: _autoProv === 'magichour' });
         }
         if (provider === 'magichour') {
@@ -5560,7 +5604,7 @@ async function apiRoute(req, res, urlPath) {
             if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ NovAI Key ទេ' });
             return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'NovAI: request failed' });
           }
-          if (out.done) return sendJSON(res, 200, { ok: true, done: true, imageUrl: out.imageUrl, imgFree: _imgFree });
+          if (out.done) { const _wm2 = await movaiWatermarkFreeImage(out.imageUrl); return sendJSON(res, 200, { ok: true, done: true, imageUrl: _wm2 || out.imageUrl, imgFree: _imgFree }); }
           return sendJSON(res, 200, { ok: true, jobId: out.jobId, imgFree: _imgFree });
         }
         if (provider === 'agnes') {
@@ -5599,7 +5643,7 @@ async function apiRoute(req, res, urlPath) {
             if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Agnes Key ទេ' });
             return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Agnes: request failed' });
           }
-          if (out.done) return sendJSON(res, 200, { ok: true, done: true, imageUrl: out.imageUrl, imgFree: _imgFree });
+          if (out.done) { const _wm2 = await movaiWatermarkFreeImage(out.imageUrl); return sendJSON(res, 200, { ok: true, done: true, imageUrl: _wm2 || out.imageUrl, imgFree: _imgFree }); }
           return sendJSON(res, 200, { ok: true, jobId: out.jobId, imgFree: _imgFree });
         }
         if (provider === 'cloudflare') {
@@ -5678,6 +5722,7 @@ async function apiRoute(req, res, urlPath) {
             if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ NovAI Key ទេ' });
             return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'NovAI: request failed' });
           }
+          if (out.status === 'done' && out.imageUrl) { const _wm3 = await movaiWatermarkFreeImage(out.imageUrl); if (_wm3) out.imageUrl = _wm3; }
           return sendJSON(res, 200, Object.assign({ ok: true }, out));
         }
         if (provider === 'agnes') {
@@ -5759,7 +5804,8 @@ async function apiRoute(req, res, urlPath) {
             if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Agnes Key ទេ' });
             return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Agnes: request failed' });
           }
-          return sendJSON(res, 200, { ok: true, url: _agnesOut.url, provider: 'agnes', model: 'agnes-image-2.5-flash', imageCost: 0, credits: _freeU.credits, songCredits: _freeU.songCredits });
+          const _wmEdit = await movaiWatermarkFreeImage(_agnesOut.url);
+          return sendJSON(res, 200, { ok: true, url: _wmEdit || _agnesOut.url, provider: 'agnes', model: 'agnes-image-2.5-flash', imageCost: 0, credits: _freeU.credits, songCredits: _freeU.songCredits });
         }
         const _ded = await deductForGeneration(email, EDIT_COST, 0, 'image:edit:' + EDIT_MODEL);
         if (!_ded.ok) return sendJSON(res, 200, { ok: false, error: _ded.error || 'Credit មិនគ្រប់ទេ', needBuy: true, kind: 'media', balance: _ded.balance, cost: EDIT_COST });
