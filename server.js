@@ -5472,6 +5472,63 @@ const VIDFETCH_TIMEOUT_MS = 30000;
 const VIDFETCH_VIDEO_QUALITIES = ['144', '240', '360', '480', '720', '1080', '1440', '2160'];
 const VIDFETCH_NO_KEY_ERROR = 'មិនទាន់ដាក់ VidFetch Key ទេ — សូមដាក់ key ក្នុង Admin → VidFetch · VidFetch key not set — add it in Admin → VidFetch';
 const VIDFETCH_QUOTA_ALL_ERROR = 'VidFetch keys ទាំងអស់អស់ quota ហ្វ្រីខែនេះហើយ — សូមរង់ចាំខែក្រោយ ឬបន្ថែម key ថ្មី · All VidFetch keys have used up their free quota this month — please wait for next month or add a new key';
+// MONTHLY MB CAP (owner order 2026-11-23 ~18:50): every registered
+// user gets 500 MB of MP3 downloads per calendar month (Phnom Penh);
+// a new month refills to a fresh 500 MB. Stored in kv_docs row
+// 'download-mb:<email>' = {month:'YYYY-MM', usedBytes}. A row from
+// another month counts as 0 used. Bytes are recorded exactly once,
+// on the once-only pending→ok history flip in the status handler
+// (failed jobs record nothing). MP3 ONLY (owner order 2026-11-23
+// ~18:46): the Download Center downloads MP3 only — video is the
+// owner's own separate search, so create rejects any other format.
+const DL_MB_MONTHLY_LIMIT_BYTES = 500 * 1024 * 1024;
+function vidfetchMbKey(email) { return 'download-mb:' + email; }
+function vidfetchMbMonth() { return imgFreeTodayDate().slice(0, 7); }
+async function vidfetchMbLoad(email) {
+  const month = vidfetchMbMonth();
+  try {
+    const rec = await loadKvDoc(vidfetchMbKey(email), null);
+    if (rec && typeof rec === 'object' && rec.month === month) return { month: month, usedBytes: Math.max(0, Math.floor(Number(rec.usedBytes) || 0)) };
+  } catch (e) {}
+  return { month: month, usedBytes: 0 };
+}
+async function vidfetchMbAdd(email, bytes) {
+  const month = vidfetchMbMonth();
+  try {
+    const cur = await vidfetchMbLoad(email);
+    const n = Math.max(0, Math.floor(Number(bytes) || 0));
+    if (!n) return cur;
+    const next = { month: cur.month, usedBytes: cur.usedBytes + n };
+    await saveKvDoc(vidfetchMbKey(email), next);
+    return next;
+  } catch (e) { return { month: month, usedBytes: 0 }; }
+}
+// FREE /v1/info for one URL: the mp3 size_bytes, or null when the
+// info call fails or lists no mp3 size. Never throws, never consumes
+// quota — /v1/info is free. A null size never blocks a create.
+async function vidfetchMp3Size(url, hooks) {
+  try {
+    const called = await vidfetchCall('/v1/info', 'POST', { url: url }, hooks && hooks.fetchFn, hooks);
+    if (!called.ok || !called.data || !Array.isArray(called.data.formats)) return null;
+    for (const f of called.data.formats) {
+      if (f && typeof f === 'object' && typeof f.quality === 'string' && f.quality.trim().toLowerCase() === 'mp3') {
+        const s = (typeof f.size === 'number' && Number.isFinite(f.size) && f.size > 0) ? Math.floor(f.size) : null;
+        if (s) return s;
+      }
+    }
+    return null;
+  } catch (e) { return null; }
+}
+// The bytes one completed job bills against the monthly cap: the
+// job's own size_bytes first, else the mp3 size the create-time info
+// lookup stored on the history item (vfMp3Size), else duration ×
+// 16,000 B/s (128 kbps). 0 when nothing is known (record nothing).
+function vidfetchJobSizeBytes(d, histItem) {
+  if (d && typeof d.size_bytes === 'number' && Number.isFinite(d.size_bytes) && d.size_bytes > 0) return Math.floor(d.size_bytes);
+  if (histItem && typeof histItem.vfMp3Size === 'number' && Number.isFinite(histItem.vfMp3Size) && histItem.vfMp3Size > 0) return Math.floor(histItem.vfMp3Size);
+  if (d && typeof d.duration_seconds === 'number' && Number.isFinite(d.duration_seconds) && d.duration_seconds > 0) return Math.floor(d.duration_seconds * 16000);
+  return 0;
+}
 function vidfetchNum(v, dflt) { const n = Number(v); return Number.isFinite(n) ? n : dflt; }
 function vidfetchStr(v) { return typeof v === 'string' ? v : ''; }
 // A key value must never reach a client or a log — scrub it out of any
@@ -5634,27 +5691,25 @@ async function vidfetchHandleInfo(req, res, body, hooks) {
   }
   return sendJSON(res, 200, { ok: true, title: vidfetchStr(d.title), duration: (typeof d.duration === 'number' && Number.isFinite(d.duration)) ? d.duration : null, thumbnail: vidfetchStr(d.thumbnail), platform: cobaltDetectPlatform(url), formats: formats });
 }
-// POST /api/download/vidfetch/create — {email, url, format, quality}.
-// format mp4 + quality Q → "Qp" (144/240/360/480/720/1080/1440/2160);
-// format mp3 → "mp3" (128 kbps, the only audio format). DAILY LIMIT:
-// the Cobalt distinct-URL counting on the SAME history row — a video
-// already counted today is free; a NEW video at 20/20 is blocked.
+// POST /api/download/vidfetch/create — {email, url, format}.
+// MP3 ONLY (owner order 2026-11-23 ~18:46): any format other than
+// "mp3" is rejected. MONTHLY MB CAP (owner order 2026-11-23 ~18:50):
+// 500 MB of MP3 per calendar month (Phnom Penh) per account. The mp3
+// size comes from a FREE /v1/info call; if that lookup fails, the
+// create is ALLOWED and the real size is recorded on completion
+// instead of blocking on an unknown size. DAILY LIMIT: the Cobalt
+// distinct-URL counting on the SAME history row — a video already
+// counted today is free; a NEW video at 20/20 is blocked.
 // Records history status 'pending' (counts only on completion).
 async function vidfetchHandleCreate(req, res, body, hooks) {
   const auth = await vidfetchRequireUser(body);
   if (auth.error) return sendJSON(res, 200, { ok: false, error: auth.error, needLogin: !!auth.needLogin });
-  let format = 'mp4';
-  if (typeof body.format === 'string' && body.format.trim()) {
-    const f = body.format.trim().toLowerCase();
-    if (f !== 'mp4' && f !== 'mp3') return sendJSON(res, 200, { ok: false, error: 'format ត្រូវតែជា mp4 ឬ mp3 · format must be mp4 or mp3' });
-    format = f;
+  if (typeof body.format === 'string' && body.format.trim() && body.format.trim().toLowerCase() !== 'mp3') {
+    return sendJSON(res, 200, { ok: false, code: 'dl_format_mp3_only', error: 'Download Center នេះទាញតែ MP3 ទេ · This Download Center downloads MP3 only' });
   }
-  let quality = '1080';
-  if (format === 'mp4' && typeof body.quality === 'string' && body.quality.trim()) {
-    const q = body.quality.trim();
-    if (VIDFETCH_VIDEO_QUALITIES.indexOf(q) !== -1) quality = q;
-  }
-  const vfFormat = format === 'mp3' ? 'mp3' : quality + 'p';
+  const format = 'mp3';
+  const quality = '';
+  const vfFormat = 'mp3';
   const chk = await vidfetchCheckUrl(body, hooks);
   if (chk.error) return sendJSON(res, 200, { ok: false, error: chk.error });
   const url = chk.url;
@@ -5665,6 +5720,12 @@ async function vidfetchHandleCreate(req, res, body, hooks) {
   if (!alreadyCounted && used >= COBALT_DAILY_LIMIT) {
     return sendJSON(res, 200, { ok: false, code: 'daily_limit', error: 'ទាញយកបាន 20 ដង/ថ្ងៃ — អស់ហើយថ្ងៃនេះ (' + used + '/20) នឹងបានម្ដងទៀតនៅថ្ងៃស្អែក · 20 downloads per day — used up for today (' + used + '/20), free again tomorrow', daily: { used: used, limit: COBALT_DAILY_LIMIT, left: 0 } });
   }
+  const mb = await vidfetchMbLoad(auth.email);
+  const mp3Size = await vidfetchMp3Size(url, hooks);
+  if (mp3Size && mb.usedBytes + mp3Size > DL_MB_MONTHLY_LIMIT_BYTES) {
+    const remaining = Math.max(0, DL_MB_MONTHLY_LIMIT_BYTES - mb.usedBytes);
+    return sendJSON(res, 200, { ok: false, code: 'dl_mb_limit', usedBytes: mb.usedBytes, remainingBytes: remaining, limitBytes: DL_MB_MONTHLY_LIMIT_BYTES, error: 'MP3 ឥតគិតថ្លៃ 500 MB ខែនេះអស់ហើយ — សូមរង់ចាំខែក្រោយ · The free 500 MB of MP3 downloads for this month is used up — please wait for next month' });
+  }
   const called = await vidfetchCall('/v1/downloads', 'POST', { url: url, format: vfFormat }, hooks && hooks.fetchFn, hooks);
   if (!called.ok) {
     const out = { ok: false, code: called.code, error: called.error };
@@ -5674,7 +5735,7 @@ async function vidfetchHandleCreate(req, res, body, hooks) {
   const d = called.data;
   const jobId = vidfetchStr(d.id);
   if (!jobId) return sendJSON(res, 200, { ok: false, code: 'vidfetch_bad_response', error: 'VidFetch ឆ្លើយមិនត្រឹមត្រូវទេ · VidFetch gave a bad response' });
-  const base = { id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), url: url, platform: platform, format: format, quality: quality, filename: '', createdAt: new Date().toISOString(), date: today, creditUsed: 0, jobId: jobId, keyIndex: (typeof called.keyIndex === 'number' ? called.keyIndex : 0), vfFormat: vfFormat, status: 'pending', error: '' };
+  const base = { id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), url: url, platform: platform, format: format, quality: quality, filename: '', createdAt: new Date().toISOString(), date: today, creditUsed: 0, jobId: jobId, keyIndex: (typeof called.keyIndex === 'number' ? called.keyIndex : 0), vfFormat: vfFormat, vfMp3Size: mp3Size, status: 'pending', error: '' };
   await cobaltRecordHistory(auth.email, base);
   return sendJSON(res, 200, { ok: true, jobId: jobId, status: vidfetchStr(d.status) || 'queued', format: format, quality: quality, daily: { used: used, limit: COBALT_DAILY_LIMIT, left: Math.max(0, COBALT_DAILY_LIMIT - used) } });
 }
@@ -5692,9 +5753,15 @@ async function vidfetchHandleStatus(req, res, body, hooks) {
   // The key that created the job polls first (a job belongs to exactly
   // one key's account); other keys are tried only if it answers 404.
   let startIndex = 0;
+  let histItem = null;
   try {
     const items = await cobaltLoadHistory(auth.email);
-    for (const it of items) { if (it && it.jobId === jobId && typeof it.keyIndex === 'number') { startIndex = it.keyIndex; break; } }
+    for (const it of items) {
+      if (it && it.jobId === jobId) {
+        if (!histItem) histItem = it;
+        if (typeof it.keyIndex === 'number') { startIndex = it.keyIndex; break; }
+      }
+    }
   } catch (e) {}
   const called = await vidfetchCall('/v1/downloads/' + encodeURIComponent(jobId), 'GET', null, hooks && hooks.fetchFn, hooks, { startIndex: startIndex, tryNextOn404: true });
   if (!called.ok) {
@@ -5710,7 +5777,14 @@ async function vidfetchHandleStatus(req, res, body, hooks) {
   if (status === 'completed') {
     out.download_url = vidfetchStr(d.download_url);
     if (out.download_url) {
-      await vidfetchFlipHistory(auth.email, jobId, 'ok');
+      // vidfetchFlipHistory returns true only on the once-only
+      // pending→ok flip, so the monthly MB is recorded exactly once
+      // even when /status is polled again after completion.
+      const flipped = await vidfetchFlipHistory(auth.email, jobId, 'ok');
+      if (flipped) {
+        const bytes = vidfetchJobSizeBytes(d, histItem);
+        if (bytes > 0) await vidfetchMbAdd(auth.email, bytes);
+      }
       const used = await cobaltDailyOkCount(auth.email, today);
       out.daily = { used: used, limit: COBALT_DAILY_LIMIT, left: Math.max(0, COBALT_DAILY_LIMIT - used) };
     } else {
@@ -5787,13 +5861,17 @@ async function vidfetchTestKey(key, fetchFn) {
 }
 // GET /api/download/vidfetch/usage — email → {ok, used_gb,
 // remaining_gb, limit_gb, keys:[{index, used_gb, remaining_gb,
-// limit_gb, exhausted}]} — sums ACROSS ALL keys (parallel calls),
-// so the page shows the owner's total free allowance; the per-key
-// array (owner order 2026-11-23 ~18:11) shows each key's own 1 GB,
-// how much it used, and which key is exhausted (remaining_gb <= 0).
-// The total limit is the sum of the keys' limits, never hardcoded.
-// Summed fields are computed from RAW per-key numbers exactly as
-// before; only the per-key entries are rounded to 2 decimals.
+// limit_gb, exhausted}], mbUsedBytes, mbLimitBytes, mbRemainingBytes}
+// — sums ACROSS ALL keys (parallel calls), so the page shows the
+// owner's total free allowance; the per-key array (owner order
+// 2026-11-23 ~18:11) shows each key's own 1 GB, how much it used,
+// and which key is exhausted (remaining_gb <= 0). The total limit is
+// the sum of the keys' limits, never hardcoded. Summed fields are
+// computed from RAW per-key numbers exactly as before; only the
+// per-key entries are rounded to 2 decimals. The mb* fields are the
+// user's own monthly MP3 allowance (500 MB/month, owner order
+// 2026-11-23 ~18:50) for the current Phnom Penh month — the page
+// reads them for the «នៅសល់ X MB ខែនេះ» line.
 async function vidfetchHandleUsage(req, res, email, hooks) {
   const em = normEmail(email);
   if (!em) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
@@ -5809,7 +5887,8 @@ async function vidfetchHandleUsage(req, res, email, hooks) {
   }
   if (!okCount) return sendJSON(res, 200, { ok: false, code: 'vidfetch_error', error: 'មើល quota មិនបានទេ — សូមព្យាយាមម្ដងទៀត · Could not read the quota — please try again' });
   const round2 = (n) => Math.round(n * 100) / 100;
-  return sendJSON(res, 200, { ok: true, used_gb: round2(used), remaining_gb: round2(remaining), limit_gb: round2(limit), keys: entries.map((e) => ({ index: e.index, used_gb: e.used === null ? null : round2(e.used), remaining_gb: e.remaining === null ? null : round2(e.remaining), limit_gb: round2(e.limit), exhausted: e.exhausted })) });
+  const mb = await vidfetchMbLoad(em);
+  return sendJSON(res, 200, { ok: true, used_gb: round2(used), remaining_gb: round2(remaining), limit_gb: round2(limit), keys: entries.map((e) => ({ index: e.index, used_gb: e.used === null ? null : round2(e.used), remaining_gb: e.remaining === null ? null : round2(e.remaining), limit_gb: round2(e.limit), exhausted: e.exhausted })), mbUsedBytes: mb.usedBytes, mbLimitBytes: DL_MB_MONTHLY_LIMIT_BYTES, mbRemainingBytes: Math.max(0, DL_MB_MONTHLY_LIMIT_BYTES - mb.usedBytes) });
 }
 /* __VIDFETCH_BLOCK_END__ */
 async function apiRoute(req, res, urlPath) {
