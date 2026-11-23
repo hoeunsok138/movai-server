@@ -5707,7 +5707,8 @@ async function apiRoute(req, res, urlPath) {
       try {
         const email = normEmail(body.email || '');
         if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនីជាមុនសិន · Please sign in first', needLogin: true });
-        const _gateErr = await genFairnessGate(email, 'magichour');
+        const _editModel = (typeof body.model === 'string' && body.model.trim().toLowerCase() === 'agnes') ? 'agnes' : 'magichour';
+        const _gateErr = await genFairnessGate(email, _editModel);
         if (_gateErr) return sendJSON(res, 200, { ok: false, error: _gateErr });
         const _blkErr = await genBlockedCheck(email, req);
         if (_blkErr) return sendJSON(res, 200, { ok: false, error: _blkErr });
@@ -5723,6 +5724,43 @@ async function apiRoute(req, res, urlPath) {
         const EDIT_MODEL = 'nano-banana-2.1';
         const EDIT_COST = 50;
         const editAspect = /9\s*:\s*16/.test(bg) ? '9:16' : /16\s*:\s*9/.test(bg) ? '16:9' : /1\s*:\s*1/.test(bg) ? '1:1' : 'auto';
+        // FREE edit (stage 16, owner 2026-11-23): Agnes image-to-image.
+        // Same endpoint as text-to-image, with the photo attached in
+        // extra_body.image — 0 MovAi credits, counts in the free
+        // 20/day image pool. Identity preservation is looser than
+        // nano-banana-2.1 (the 50-credit path below), which is why
+        // the client offers both. Returns {ok, url} directly (sync).
+        if (_editModel === 'agnes') {
+          const _freeUsers = await loadUsers();
+          const _freeU = _freeUsers[email];
+          if (!_freeU) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនីជាមុនសិន · Please sign in first', needLogin: true });
+          const _win = _freeDailyWindow(_freeU.imgFreeDaily);
+          if (_win.used >= IMG_FREE_DAILY_LIMIT) {
+            return sendJSON(res, 200, { ok: false, error: 'រូប Free អស់ហើយ (20/20) — នឹងបាន Free ម្ដងទៀតនៅថ្ងៃ ' + _win.resetDate + ' · Free images used up (20/20) — free again on ' + _win.resetDate, code: 'image_free_daily_limit', imgFree: { date: _win.start, limit: IMG_FREE_DAILY_LIMIT, used: _win.used, left: 0, resetDate: _win.resetDate, kind: 'image' } });
+          }
+          _freeU.imgFreeDaily = { start: _win.start, used: _win.used + 1 };
+          const _freeToday = imgFreeTodayDate();
+          const _dailyUsed = (_freeU.imgDaily && typeof _freeU.imgDaily === 'object' && _freeU.imgDaily.date === _freeToday) ? Math.max(0, Math.floor(Number(_freeU.imgDaily.used) || 0)) : 0;
+          _freeU.imgDaily = { date: _freeToday, used: _dailyUsed + 1 };
+          _freeUsers[email] = _freeU;
+          await saveUsers(_freeUsers);
+          const _agnesRatio = (editAspect === '9:16' || editAspect === '16:9' || editAspect === '1:1') ? editAspect : '1:1';
+          let _agnesOut;
+          try {
+            _agnesOut = await withProviderKeyRotation('agnes', async (k) => {
+              const r = await fetch('https://apihub.agnes-ai.com/v1/images/generations', { method: 'POST', headers: { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'agnes-image-2.5-flash', prompt: editPrompt, size: '1K', ratio: _agnesRatio, extra_body: { image: [imageUrl], response_format: 'url' } }), signal: AbortSignal.timeout(120000) });
+              const j = await r.json().catch(() => null);
+              const _u = j && j.data && (Array.isArray(j.data) ? (j.data[0] && (j.data[0].url || j.data[0].image_url)) : (j.data.url || j.data.image_url));
+              if (_u) return { url: _u };
+              throw rotErr('Agnes: ' + genErrText(j, 'HTTP ' + r.status), r.status);
+            });
+          } catch (e) {
+            await imgFreeRefund(email, false);
+            if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Agnes Key ទេ' });
+            return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Agnes: request failed' });
+          }
+          return sendJSON(res, 200, { ok: true, url: _agnesOut.url, provider: 'agnes', model: 'agnes-image-2.5-flash', imageCost: 0, credits: _freeU.credits, songCredits: _freeU.songCredits });
+        }
         const _ded = await deductForGeneration(email, EDIT_COST, 0, 'image:edit:' + EDIT_MODEL);
         if (!_ded.ok) return sendJSON(res, 200, { ok: false, error: _ded.error || 'Credit មិនគ្រប់ទេ', needBuy: true, kind: 'media', balance: _ded.balance, cost: EDIT_COST });
         let out;
