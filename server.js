@@ -5719,7 +5719,7 @@ async function apiRoute(req, res, urlPath) {
           const _en = await translateImgPromptToEnglish(bg);
           if (_en) bg = _en.slice(0, 500);
         }
-        const editPrompt = 'Keep the exact same person, face, clothes and pose from the photo unchanged. Only replace the background with: ' + bg + '. Photorealistic, natural lighting, seamless blend, highly detailed, sharp focus.';
+        const editPrompt = 'Follow this edit instruction exactly, changing only what it asks for and keeping everything else in the photo unchanged: ' + bg + '. Photorealistic, natural lighting, seamless blend, highly detailed, sharp focus.';
         const EDIT_MODEL = 'nano-banana-2.1';
         const EDIT_COST = 50;
         const _ded = await deductForGeneration(email, EDIT_COST, 0, 'image:edit:' + EDIT_MODEL);
