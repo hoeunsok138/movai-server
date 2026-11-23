@@ -5722,12 +5722,13 @@ async function apiRoute(req, res, urlPath) {
         const editPrompt = 'Follow this edit instruction exactly, changing only what it asks for and keeping everything else in the photo unchanged: ' + bg + '. Photorealistic, natural lighting, seamless blend, highly detailed, sharp focus.';
         const EDIT_MODEL = 'nano-banana-2.1';
         const EDIT_COST = 50;
+        const editAspect = /9\s*:\s*16/.test(bg) ? '9:16' : /16\s*:\s*9/.test(bg) ? '16:9' : /1\s*:\s*1/.test(bg) ? '1:1' : 'auto';
         const _ded = await deductForGeneration(email, EDIT_COST, 0, 'image:edit:' + EDIT_MODEL);
         if (!_ded.ok) return sendJSON(res, 200, { ok: false, error: _ded.error || 'Credit មិនគ្រប់ទេ', needBuy: true, kind: 'media', balance: _ded.balance, cost: EDIT_COST });
         let out;
         try {
           out = await withProviderKeyRotation('magichour', async (k) => {
-            const r = await fetch('https://api.magichour.ai/v1/ai-image-editor', { method: 'POST', headers: { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'MovAi photo edit', model: EDIT_MODEL, image_count: 1, aspect_ratio: 'auto', resolution: '1k', style: { prompt: editPrompt }, assets: { image_file_paths: [imageUrl] } }), signal: AbortSignal.timeout(60000) });
+            const r = await fetch('https://api.magichour.ai/v1/ai-image-editor', { method: 'POST', headers: { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'MovAi photo edit', model: EDIT_MODEL, image_count: 1, aspect_ratio: editAspect, resolution: '1k', style: { prompt: editPrompt }, assets: { image_file_paths: [imageUrl] } }), signal: AbortSignal.timeout(60000) });
             const j = await r.json().catch(() => null);
             const id = j && j.id;
             if (id) return { jobId: id };
