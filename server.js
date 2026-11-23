@@ -5077,6 +5077,14 @@ async function apiRoute(req, res, urlPath) {
   // site (~line 8824) is reached — a `let` there is TDZ for those
   // requests ("Cannot access '_cloudQueue' before initialization").
   let _cloudQueue = Promise.resolve();
+  // Stage 33 fix (2026-11-23): `let _cloudinary` MUST live here too, not
+  // down at the Cloudinary section — apiRoute returns at the first
+  // matching branch, so early branches (/api/gen/image,
+  // /api/gen/image/edit) never reach the later declaration and any
+  // Cloudinary call from them throws "Cannot access '_cloudinary'
+  // before initialization" (TDZ). That is why the watermark silently
+  // never attached. Do NOT move this back down.
+  let _cloudinary = null;
   // Startup heal (owner order 2026-11-18): once, on the first request
   // after (re)start, re-link dead Magic Hour / proxy-upload song URLs to
   // their Cloudinary copy when one exists. Fire-and-forget, never blocks.
@@ -11588,7 +11596,9 @@ async function apiRoute(req, res, urlPath) {
   // Uploads run ONE AT A TIME through _cloudQueue, so setting the
   // config inside the queued block (right before the upload and the
   // URL build) is safe — no two accounts can interleave.
-  let _cloudinary = null;
+  // NOTE: `let _cloudinary` lives at the TOP of apiRoute (see above) —
+  // do NOT re-declare it here (duplicate `let` = SyntaxError) and do
+  // NOT move it back down (TDZ for early branches).
   function cloudinarySdk() {
     if (_cloudinary) return _cloudinary;
     try { _cloudinary = require('cloudinary').v2; return _cloudinary; }
