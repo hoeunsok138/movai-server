@@ -2411,8 +2411,10 @@ function publicSettings(s) {
 // agnes (Agnes AI — free text/image/video Flash models, OpenAI-compatible),
 // openrouter (stored keys kept in Admin; no longer used for lyrics
 // since 2026-11-19 — AI Lyrics now uses Groq).
+// vidfetch (VidFetch — video download API, Download Center backend
+// since 2026-11-23; key vf_live_sk_... pasted by the owner in Admin).
 const ADMIN_KEYS_FILE = path.join(DATA_DIR, 'admin-keys.json');
-const KNOWN_KEY_PROVIDERS = ['novai', 'magichour', 'masterpiecex', 'hunyuan3d', 'suno', 'acemusic', 'musicapi', 'tavus', 'groq', 'mvsep', 'agnes', 'openrouter'];
+const KNOWN_KEY_PROVIDERS = ['novai', 'magichour', 'masterpiecex', 'hunyuan3d', 'suno', 'acemusic', 'musicapi', 'tavus', 'groq', 'mvsep', 'agnes', 'openrouter', 'vidfetch'];
 function normProvider(v) {
   if (typeof v !== 'string') return '';
   let p = v.trim().toLowerCase().replace(/[\s_-]+/g, '');
@@ -5422,6 +5424,337 @@ async function cobaltHandleDownloadResolve(req, res, body, hooks) {
   return sendJSON(res, 200, { ok: true, kind: mapped.kind, url: mapped.url || '', filename: mapped.filename || '', picker: mapped.picker || null, audio: mapped.audio || '', cobalt: mapped.cobalt || null, platform: platform, format: format, quality: quality, creditUsed: 0, daily: { used: usedNow, limit: COBALT_DAILY_LIMIT, left: Math.max(0, COBALT_DAILY_LIMIT - usedNow) } });
 }
 /* __COBALT_BLOCK_END__ */
+
+/* __VIDFETCH_BLOCK_BEGIN__ */
+/* ---------------- Download Center — VidFetch (2026-11-23) ---------
+   Owner order 2026-11-23 ~17:37: the self-hosted Cobalt download server
+   is ABANDONED (YouTube blocks its IP, Turnstile fails) — the Download
+   Center now runs on the VidFetch API (vidfetch.dev): one HTTP call per
+   download, no self-hosting, no Turnstile, no wake-up. The owner holds
+   10 VidFetch accounts (one per Gmail) = 10 keys = 10 GB/month free.
+   MULTI-KEY ROTATION (owner order ~17:42): keys live in the admin-keys
+   kv_docs row under "vidfetch" (Admin → VidFetch key list, add/remove
+   like Groq). Every call tries keys in order; on QUOTA-EXHAUSTED it
+   switches to the next key and retries the same request (once per key);
+   when all keys are exhausted it returns the bilingual quota error
+   below. NON-quota errors fail normally WITHOUT rotating. Quota =
+   HTTP 402 (SDK QuotaExceededError) or a 403/429 whose error code or
+   message mentions quota/allowance — verified in videofetch-sdk 0.6.0
+   errors.py (429 codes are concurrency_limit_exceeded /
+   queue_limit_exceeded / platform_at_capacity — NOT quota; 403 is
+   account_suspended; 401 is a bad key; 404 means the job does not
+   belong to this key).
+   SECURITY: keys are read LIVE per call via adminProviderKeyList
+   (no restart needed); a key value NEVER appears in any response,
+   log or error (vidfetchSafeMsg scrubs vf_live_sk_… just in case).
+   FREE: /v1/info costs nothing; a completed download bills >= 20 MiB
+   against that key's 1 GB/month; failed jobs cost nothing.
+   DAILY LIMIT: the Cobalt distinct-URL counting is REUSED (same
+   'download-history:<email>' row): 1 video = 1 count/day no matter
+   how many formats are checked; a video counted today is free; only
+   a NEW video at 20/20 is blocked. History items carry jobId +
+   keyIndex so the status poll uses the key that created the job (a
+   job belongs to exactly one key's account).
+   FIELD NAMES (verified from videofetch-sdk 0.6.0 models.py):
+   /v1/info → VideoInfo {title, duration (seconds), thumbnail,
+   formats:[{quality:"720p", size (bytes), container:"MP4"}]}.
+   /v1/downloads → Download {id, status queued|processing|completed|
+   failed|deleted, format, progress, title, thumbnail,
+   duration_seconds, size_bytes, download_url,
+   download_url_expires_at, cost_usd, error{message}, error_code,
+   error_message}. /v1/usage → Usage {plan, quota_gb, used_gb,
+   remaining_gb, active_jobs, concurrency_limit, alert_level}.
+   PLACEMENT: module scope, OUTSIDE apiRoute (TDZ-safe, like the
+   Cobalt block above it). The branches (inside apiRoute, just before
+   /api/gen/image) only read the body and call the handlers below. */
+const VIDFETCH_BASE_URL = 'https://api.vidfetch.dev';
+const VIDFETCH_TIMEOUT_MS = 30000;
+const VIDFETCH_VIDEO_QUALITIES = ['144', '240', '360', '480', '720', '1080', '1440', '2160'];
+const VIDFETCH_NO_KEY_ERROR = 'មិនទាន់ដាក់ VidFetch Key ទេ — សូមដាក់ key ក្នុង Admin → VidFetch · VidFetch key not set — add it in Admin → VidFetch';
+const VIDFETCH_QUOTA_ALL_ERROR = 'VidFetch keys ទាំងអស់អស់ quota ហ្វ្រីខែនេះហើយ — សូមរង់ចាំខែក្រោយ ឬបន្ថែម key ថ្មី · All VidFetch keys have used up their free quota this month — please wait for next month or add a new key';
+function vidfetchNum(v, dflt) { const n = Number(v); return Number.isFinite(n) ? n : dflt; }
+function vidfetchStr(v) { return typeof v === 'string' ? v : ''; }
+// A key value must never reach a client or a log — scrub it out of any
+// provider message, just in case the provider ever echoes it back.
+function vidfetchSafeMsg(m) {
+  return String(m || '').trim().replace(/vf_live_sk_[A-Za-z0-9_-]+/g, '[key]');
+}
+// All stored VidFetch keys, in Admin order, deduped. `hooks.keys`
+// (tests only) overrides the live list. Empty list = not configured.
+async function vidfetchKeys(hooks) {
+  let raw = null;
+  if (hooks && Array.isArray(hooks.keys)) raw = hooks.keys;
+  else {
+    try { raw = await adminProviderKeyList('vidfetch'); } catch (e) { raw = null; }
+  }
+  const out = [];
+  const arr = Array.isArray(raw) ? raw : [];
+  for (const e of arr) {
+    const k = (e && typeof e === 'object') ? (typeof e.key === 'string' ? e.key.trim() : '') : (typeof e === 'string' ? e.trim() : '');
+    if (k && out.indexOf(k) === -1) out.push(k);
+  }
+  return out;
+}
+// Does an error body say quota/allowance? (402 is quota regardless.)
+function vidfetchBodySaysQuota(j) {
+  if (!j || typeof j !== 'object') return false;
+  const parts = [];
+  if (typeof j.code === 'string') parts.push(j.code);
+  if (typeof j.message === 'string') parts.push(j.message);
+  const e = j.error;
+  if (typeof e === 'string') parts.push(e);
+  else if (e && typeof e === 'object') {
+    if (typeof e.code === 'string') parts.push(e.code);
+    if (typeof e.message === 'string') parts.push(e.message);
+  }
+  return /quota|allowance/i.test(parts.join(' '));
+}
+// One attempt with ONE key. Never throws. Returns
+// {ok, status, data} | {ok:false, code, error, retryAfter?}.
+// Codes: vidfetch_quota | vidfetch_busy | vidfetch_timeout |
+// vidfetch_unreachable | vidfetch_error | vidfetch_bad_response |
+// vidfetch_not_found | server_not_configured (401 = bad/expired key).
+async function vidfetchCallOnce(path, method, body, key, fetchFn) {
+  const f = fetchFn || fetch;
+  let r;
+  try {
+    const opts = { method: method, headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key }, signal: AbortSignal.timeout(VIDFETCH_TIMEOUT_MS) };
+    if (body) opts.body = JSON.stringify(body);
+    r = await f(VIDFETCH_BASE_URL + path, opts);
+  } catch (e) {
+    const msg = String((e && e.name) || '') + ' ' + String((e && e.message) || '');
+    if (/abort|timeout/i.test(msg)) return { ok: false, code: 'vidfetch_timeout', error: 'VidFetch ឆ្លើយយឺតពេក — សូមព្យាយាមម្ដងទៀត · VidFetch timed out — please try again' };
+    return { ok: false, code: 'vidfetch_unreachable', error: 'ភ្ជាប់ទៅ VidFetch មិនបានទេ — សូមព្យាយាមម្ដងទៀត · Could not reach VidFetch — please try again' };
+  }
+  let j = null;
+  try { j = await r.json(); } catch (e) { j = null; }
+  const status = r.status;
+  if (status === 401) return { ok: false, code: 'server_not_configured', error: VIDFETCH_NO_KEY_ERROR };
+  if (status === 402 || ((status === 403 || status === 429) && vidfetchBodySaysQuota(j))) {
+    return { ok: false, code: 'vidfetch_quota', error: 'VidFetch key នេះអស់ quota ហ្វ្រីខែនេះហើយ · This VidFetch key used up its free quota this month' };
+  }
+  if (status === 429) {
+    let ra = null;
+    try { const h = r.headers && r.headers.get ? r.headers.get('retry-after') : null; const n = Number(h); if (Number.isFinite(n) && n > 0) ra = Math.min(30, Math.ceil(n)); } catch (e) {}
+    return { ok: false, code: 'vidfetch_busy', error: 'VidFetch កំពុងរវល់ — សូមព្យាយាមម្ដងទៀតក្នុងពេលបន្តិច · VidFetch is busy — please try again shortly', retryAfter: ra };
+  }
+  if (status === 404) return { ok: false, code: 'vidfetch_not_found', error: 'រកមិនឃើញទេ · Not found' };
+  if (!r.ok) {
+    let m = '';
+    if (j && typeof j === 'object') {
+      if (typeof j.message === 'string') m = j.message;
+      else if (j.error && typeof j.error === 'object' && typeof j.error.message === 'string') m = j.error.message;
+      else if (typeof j.error === 'string') m = j.error;
+      else if (typeof j.code === 'string') m = j.code;
+    }
+    return { ok: false, code: 'vidfetch_error', error: vidfetchSafeMsg(m) || 'VidFetch មានបញ្ហា — សូមព្យាយាមម្ដងទៀត · VidFetch error — please try again' };
+  }
+  if (!j || typeof j !== 'object') return { ok: false, code: 'vidfetch_bad_response', error: 'VidFetch ឆ្លើយមិនត្រឹមត្រូវទេ · VidFetch gave a bad response' };
+  return { ok: true, status: status, data: j };
+}
+// Try keys in order (starting at opts.startIndex, then the rest in
+// order). On quota-exhausted, switch to the next key and retry the
+// same request (once per key). On 404 with opts.tryNextOn404, also
+// try the next key (a job belongs to exactly one key — the status
+// poll uses this). Returns {ok, status, data, keyIndex} on success,
+// else the last failure; when every key is quota-exhausted,
+// code 'vidfetch_quota_all'. `hooks.keys` (tests) overrides the list.
+async function vidfetchCall(path, method, body, fetchFn, hooks, opts) {
+  const keys = await vidfetchKeys(hooks);
+  if (!keys.length) return { ok: false, code: 'server_not_configured', error: VIDFETCH_NO_KEY_ERROR };
+  const o = opts || {};
+  const start = (typeof o.startIndex === 'number' && o.startIndex >= 0 && o.startIndex < keys.length) ? o.startIndex : 0;
+  const order = [];
+  for (let i = 0; i < keys.length; i++) order.push((start + i) % keys.length);
+  let sawQuota = false;
+  let last = null;
+  for (const ix of order) {
+    const r = await vidfetchCallOnce(path, method, body, keys[ix], fetchFn);
+    if (r.ok) { r.keyIndex = ix; return r; }
+    last = r;
+    if (r.code === 'vidfetch_quota') { sawQuota = true; continue; }
+    if (r.code === 'vidfetch_not_found' && o.tryNextOn404) continue;
+    return r;
+  }
+  if (sawQuota) return { ok: false, code: 'vidfetch_quota_all', error: VIDFETCH_QUOTA_ALL_ERROR };
+  return last || { ok: false, code: 'vidfetch_error', error: 'VidFetch មានបញ្ហា — សូមព្យាយាមម្ដងទៀត · VidFetch error — please try again' };
+}
+// Signed-in check shared by the POST handlers (same rule as the
+// Cobalt handler: a real email that exists in the users table).
+async function vidfetchRequireUser(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'ទិន្នន័យមិនត្រឹមត្រូវទេ · Bad request' };
+  const email = normEmail(body.email);
+  if (!email) return { error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true };
+  const users = await loadUsers();
+  if (!users || !users[email]) return { error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true };
+  return { email: email };
+}
+async function vidfetchCheckUrl(body, hooks) {
+  const rawUrl = typeof body.url === 'string' ? body.url.trim() : '';
+  if (!rawUrl) return { error: 'សូមដាក់ link វីដេអូជាមុនសិន · Please paste a video link first' };
+  const checked = await cobaltValidateRemoteUrl(rawUrl, hooks && hooks.lookup);
+  if (!checked.ok) return { error: checked.error };
+  return { url: checked.url };
+}
+// Flip a pending history item (same jobId) to a terminal status.
+// Only pending items move — a completed job polled twice stays 'ok'.
+async function vidfetchFlipHistory(email, jobId, status) {
+  try {
+    const items = await cobaltLoadHistory(email);
+    let changed = false;
+    for (const it of items) {
+      if (it && it.jobId === jobId && it.status === 'pending') { it.status = status; changed = true; break; }
+    }
+    if (changed) await saveKvDoc(cobaltHistoryKey(email), items.slice(0, COBALT_MAX_HISTORY));
+    return changed;
+  } catch (e) { return false; }
+}
+// POST /api/download/vidfetch/info — {email, url} → {ok, title,
+// duration, thumbnail, platform, formats:[{quality, size_bytes,
+// container}]}. FREE: no daily-limit cost, no history. `hooks` is a
+// TEST SEAM only ({lookup, fetchFn, keys}) — the apiRoute branch
+// never passes it. Every response is sendJSON 200 with {ok}.
+async function vidfetchHandleInfo(req, res, body, hooks) {
+  const auth = await vidfetchRequireUser(body);
+  if (auth.error) return sendJSON(res, 200, { ok: false, error: auth.error, needLogin: !!auth.needLogin });
+  const chk = await vidfetchCheckUrl(body, hooks);
+  if (chk.error) return sendJSON(res, 200, { ok: false, error: chk.error });
+  const url = chk.url;
+  const called = await vidfetchCall('/v1/info', 'POST', { url: url }, hooks && hooks.fetchFn, hooks);
+  if (!called.ok) return sendJSON(res, 200, { ok: false, code: called.code, error: called.error });
+  const d = called.data;
+  const formats = [];
+  if (Array.isArray(d.formats)) {
+    for (const f of d.formats) {
+      if (!f || typeof f !== 'object') continue;
+      const q = typeof f.quality === 'string' ? f.quality.trim() : '';
+      if (!q) continue;
+      formats.push({ quality: q, size_bytes: (typeof f.size === 'number' && Number.isFinite(f.size) && f.size >= 0) ? Math.floor(f.size) : null, container: typeof f.container === 'string' ? f.container : 'MP4' });
+    }
+  }
+  return sendJSON(res, 200, { ok: true, title: vidfetchStr(d.title), duration: (typeof d.duration === 'number' && Number.isFinite(d.duration)) ? d.duration : null, thumbnail: vidfetchStr(d.thumbnail), platform: cobaltDetectPlatform(url), formats: formats });
+}
+// POST /api/download/vidfetch/create — {email, url, format, quality}.
+// format mp4 + quality Q → "Qp" (144/240/360/480/720/1080/1440/2160);
+// format mp3 → "mp3" (128 kbps, the only audio format). DAILY LIMIT:
+// the Cobalt distinct-URL counting on the SAME history row — a video
+// already counted today is free; a NEW video at 20/20 is blocked.
+// Records history status 'pending' (counts only on completion).
+async function vidfetchHandleCreate(req, res, body, hooks) {
+  const auth = await vidfetchRequireUser(body);
+  if (auth.error) return sendJSON(res, 200, { ok: false, error: auth.error, needLogin: !!auth.needLogin });
+  let format = 'mp4';
+  if (typeof body.format === 'string' && body.format.trim()) {
+    const f = body.format.trim().toLowerCase();
+    if (f !== 'mp4' && f !== 'mp3') return sendJSON(res, 200, { ok: false, error: 'format ត្រូវតែជា mp4 ឬ mp3 · format must be mp4 or mp3' });
+    format = f;
+  }
+  let quality = '1080';
+  if (format === 'mp4' && typeof body.quality === 'string' && body.quality.trim()) {
+    const q = body.quality.trim();
+    if (VIDFETCH_VIDEO_QUALITIES.indexOf(q) !== -1) quality = q;
+  }
+  const vfFormat = format === 'mp3' ? 'mp3' : quality + 'p';
+  const chk = await vidfetchCheckUrl(body, hooks);
+  if (chk.error) return sendJSON(res, 200, { ok: false, error: chk.error });
+  const url = chk.url;
+  const platform = cobaltDetectPlatform(url);
+  const today = imgFreeTodayDate();
+  const used = await cobaltDailyOkCount(auth.email, today);
+  const alreadyCounted = await cobaltUrlCountedToday(auth.email, url, today);
+  if (!alreadyCounted && used >= COBALT_DAILY_LIMIT) {
+    return sendJSON(res, 200, { ok: false, code: 'daily_limit', error: 'ទាញយកបាន 20 ដង/ថ្ងៃ — អស់ហើយថ្ងៃនេះ (' + used + '/20) នឹងបានម្ដងទៀតនៅថ្ងៃស្អែក · 20 downloads per day — used up for today (' + used + '/20), free again tomorrow', daily: { used: used, limit: COBALT_DAILY_LIMIT, left: 0 } });
+  }
+  const called = await vidfetchCall('/v1/downloads', 'POST', { url: url, format: vfFormat }, hooks && hooks.fetchFn, hooks);
+  if (!called.ok) {
+    const out = { ok: false, code: called.code, error: called.error };
+    if (called.retryAfter) out.retryAfter = called.retryAfter;
+    return sendJSON(res, 200, out);
+  }
+  const d = called.data;
+  const jobId = vidfetchStr(d.id);
+  if (!jobId) return sendJSON(res, 200, { ok: false, code: 'vidfetch_bad_response', error: 'VidFetch ឆ្លើយមិនត្រឹមត្រូវទេ · VidFetch gave a bad response' });
+  const base = { id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), url: url, platform: platform, format: format, quality: quality, filename: '', createdAt: new Date().toISOString(), date: today, creditUsed: 0, jobId: jobId, keyIndex: (typeof called.keyIndex === 'number' ? called.keyIndex : 0), vfFormat: vfFormat, status: 'pending', error: '' };
+  await cobaltRecordHistory(auth.email, base);
+  return sendJSON(res, 200, { ok: true, jobId: jobId, status: vidfetchStr(d.status) || 'queued', format: format, quality: quality, daily: { used: used, limit: COBALT_DAILY_LIMIT, left: Math.max(0, COBALT_DAILY_LIMIT - used) } });
+}
+// POST /api/download/vidfetch/status — {email, jobId} → {ok, status,
+// progress, download_url (completed only), size_bytes, expires_at,
+// daily}. Completed flips the matching history item (same jobId) to
+// 'ok' (distinct-URL rule counts it once); failed/cancelled/deleted
+// marks it 'error' (costs nothing). A completed job with no
+// download_url is reported as failed. Unknown shapes → generic error.
+async function vidfetchHandleStatus(req, res, body, hooks) {
+  const auth = await vidfetchRequireUser(body);
+  if (auth.error) return sendJSON(res, 200, { ok: false, error: auth.error, needLogin: !!auth.needLogin });
+  const jobId = typeof body.jobId === 'string' ? body.jobId.trim() : '';
+  if (!jobId || jobId.length > 200) return sendJSON(res, 200, { ok: false, error: 'jobId មិនត្រឹមត្រូវទេ · Bad job id' });
+  // The key that created the job polls first (a job belongs to exactly
+  // one key's account); other keys are tried only if it answers 404.
+  let startIndex = 0;
+  try {
+    const items = await cobaltLoadHistory(auth.email);
+    for (const it of items) { if (it && it.jobId === jobId && typeof it.keyIndex === 'number') { startIndex = it.keyIndex; break; } }
+  } catch (e) {}
+  const called = await vidfetchCall('/v1/downloads/' + encodeURIComponent(jobId), 'GET', null, hooks && hooks.fetchFn, hooks, { startIndex: startIndex, tryNextOn404: true });
+  if (!called.ok) {
+    if (called.code === 'vidfetch_not_found') return sendJSON(res, 200, { ok: false, code: 'job_not_found', error: 'រក job នេះមិនឃើញទេ — វាអាចផុតកំណត់ហើយ · Job not found — it may have expired' });
+    const out = { ok: false, code: called.code, error: called.error };
+    if (called.retryAfter) out.retryAfter = called.retryAfter;
+    return sendJSON(res, 200, out);
+  }
+  const d = called.data;
+  const status = vidfetchStr(d.status) || 'processing';
+  const today = imgFreeTodayDate();
+  const out = { ok: true, status: status, progress: (typeof d.progress === 'number' && Number.isFinite(d.progress)) ? Math.max(0, Math.min(100, Math.floor(d.progress))) : 0, download_url: '', size_bytes: (typeof d.size_bytes === 'number' && Number.isFinite(d.size_bytes)) ? Math.floor(d.size_bytes) : null, expires_at: vidfetchStr(d.download_url_expires_at) };
+  if (status === 'completed') {
+    out.download_url = vidfetchStr(d.download_url);
+    if (out.download_url) {
+      await vidfetchFlipHistory(auth.email, jobId, 'ok');
+      const used = await cobaltDailyOkCount(auth.email, today);
+      out.daily = { used: used, limit: COBALT_DAILY_LIMIT, left: Math.max(0, COBALT_DAILY_LIMIT - used) };
+    } else {
+      out.status = 'failed';
+      out.error = 'VidFetch បញ្ចប់ការងារហើយ តែគ្មាន link ទាញយកទេ — សូមព្យាយាមម្ដងទៀត · VidFetch finished but gave no download link — please try again';
+      await vidfetchFlipHistory(auth.email, jobId, 'error');
+    }
+  } else if (status === 'failed' || status === 'deleted' || status === 'cancelled') {
+    await vidfetchFlipHistory(auth.email, jobId, 'error');
+    let m = '';
+    if (d.error && typeof d.error === 'object' && typeof d.error.message === 'string') m = d.error.message;
+    else if (typeof d.error_message === 'string') m = d.error_message;
+    else if (typeof d.error_code === 'string') m = d.error_code;
+    out.error = vidfetchSafeMsg(m) || 'ការទាញយកបរាជ័យ — សូមព្យាយាមម្ដងទៀត · Download failed — please try again';
+  }
+  return sendJSON(res, 200, out);
+}
+// GET /api/download/vidfetch/usage — email → {ok, used_gb,
+// remaining_gb, limit_gb} — sums ACROSS ALL keys (parallel calls),
+// so the page shows the owner's total free allowance. The total
+// limit is the sum of the keys' limits, never hardcoded.
+async function vidfetchHandleUsage(req, res, email, hooks) {
+  const em = normEmail(email);
+  if (!em) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
+  const users = await loadUsers();
+  if (!users || !users[em]) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
+  const keys = await vidfetchKeys(hooks);
+  if (!keys.length) return sendJSON(res, 200, { ok: false, code: 'server_not_configured', error: VIDFETCH_NO_KEY_ERROR });
+  const fetchFn = hooks && hooks.fetchFn;
+  const results = await Promise.all(keys.map((k) => vidfetchCallOnce('/v1/usage', 'GET', null, k, fetchFn)));
+  let used = 0, remaining = 0, limit = 0, okCount = 0;
+  for (const r of results) {
+    if (!r.ok || !r.data) continue;
+    okCount++;
+    const q = vidfetchNum(r.data.quota_gb, 0);
+    const u = vidfetchNum(r.data.used_gb, 0);
+    const rem = (typeof r.data.remaining_gb === 'number' && Number.isFinite(r.data.remaining_gb)) ? r.data.remaining_gb : Math.max(0, q - u);
+    used += u; remaining += rem; limit += q;
+  }
+  if (!okCount) return sendJSON(res, 200, { ok: false, code: 'vidfetch_error', error: 'មើល quota មិនបានទេ — សូមព្យាយាមម្ដងទៀត · Could not read the quota — please try again' });
+  const round2 = (n) => Math.round(n * 100) / 100;
+  return sendJSON(res, 200, { ok: true, used_gb: round2(used), remaining_gb: round2(remaining), limit_gb: round2(limit) });
+}
+/* __VIDFETCH_BLOCK_END__ */
 async function apiRoute(req, res, urlPath) {
   // One Cloudinary upload at a time (serialised through _cloudQueue).
   // MUST stay at the TOP of apiRoute: cloudinaryStoreSong is called from
@@ -5727,6 +6060,41 @@ async function apiRoute(req, res, urlPath) {
   if (req.method === 'GET' && urlPath === '/api/download/wake') {
     cobaltWakeCobalt().then((r) => { try { sendJSON(res, 200, r); } catch (e) {} })
       .catch(() => { try { sendJSON(res, 200, { ok: true, cobalt: 'waking' }); } catch (e2) {} });
+    return;
+  }
+  // ---- Download Center (VidFetch) — owner order 2026-11-23 ----
+  // POST /api/download/vidfetch/info | create | status, GET .../usage.
+  // All logic lives in the module-scope __VIDFETCH_BLOCK__ below; each
+  // branch only reads the body and calls its handler. Every endpoint
+  // answers sendJSON 200 with {ok}; a bad JSON body gets 400.
+  if (req.method === 'POST' && urlPath === '/api/download/vidfetch/info') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      try { await vidfetchHandleInfo(req, res, body); }
+      catch (e) { try { sendJSON(res, 200, { ok: false, error: 'Download Center មានបញ្ហា — សូមព្យាយាមម្ដងទៀត · Download Center error — please try again' }); } catch (e2) {} }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  if (req.method === 'POST' && urlPath === '/api/download/vidfetch/create') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      try { await vidfetchHandleCreate(req, res, body); }
+      catch (e) { try { sendJSON(res, 200, { ok: false, error: 'Download Center មានបញ្ហា — សូមព្យាយាមម្ដងទៀត · Download Center error — please try again' }); } catch (e2) {} }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  if (req.method === 'POST' && urlPath === '/api/download/vidfetch/status') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      try { await vidfetchHandleStatus(req, res, body); }
+      catch (e) { try { sendJSON(res, 200, { ok: false, error: 'Download Center មានបញ្ហា — សូមព្យាយាមម្ដងទៀត · Download Center error — please try again' }); } catch (e2) {} }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  if (req.method === 'GET' && urlPath === '/api/download/vidfetch/usage') {
+    (async () => {
+      try {
+        const qp = new URL(req.url, 'http://localhost').searchParams;
+        await vidfetchHandleUsage(req, res, qp.get('email') || '');
+      } catch (e) { try { sendJSON(res, 200, { ok: false, error: 'Download Center មានបញ្ហា — សូមព្យាយាមម្ដងទៀត · Download Center error — please try again' }); } catch (e2) {} }
+    })();
     return;
   }
   if (req.method === 'POST' && urlPath === '/api/gen/image') {
