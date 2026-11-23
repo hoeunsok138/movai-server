@@ -5070,6 +5070,305 @@ function sunoPreviewFromData(d) {
   return first ? (first.stream_audio_url || first.audio_url) : '';
 }
 let _healStarted = false; // startup song-URL heal runs once (see apiRoute top)
+
+/* __COBALT_BLOCK_BEGIN__ */
+/* ---------------- Download Center — Cobalt (Phase 2, 2026-11-23) ---------
+   Owner order 2026-11-23 ~14:45: a Download Center (Download Video +
+   Download Audio) via OUR OWN Cobalt instance on Render. This block is
+   ADDITIVE ONLY — it adds one endpoint (POST /api/download/resolve) and
+   its helpers; no existing handler, route or behaviour is touched.
+   PLACEMENT: everything lives at MODULE scope, OUTSIDE apiRoute — the
+   TDZ hazard (Stage 33) only bites `let`/`const` declared deep inside
+   apiRoute, so nothing here can be in a dead zone for an early branch.
+   The branch itself (inside apiRoute, just before /api/gen/image) only
+   reads the body and calls cobaltHandleDownloadResolve below.
+   SECURITY: the Cobalt API key comes from env COBALT_API_KEY (set on
+   movai-proxy via the Render dashboard; NEVER hardcoded, NEVER logged).
+   The key is read at call time, so a proxy restart picks up a rotation
+   with no code change. FREE: 0 credits, 20 successful downloads/day
+   per user (Phnom Penh day). History lives in Supabase kv_docs, one
+   row per user ('download-history:<email>'), no video bytes in the DB.
+   YOUTUBE BLOCK: when Cobalt answers error.api.fetch.fail for youtube,
+   the handler returns code 'youtube_blocked' — the Phase 3 frontend
+   uses that code to trigger the phone-direct fallback (community
+   instance called from the user's own connection). That case is NEVER
+   hidden inside a generic error. */
+const COBALT_BASE_URL = 'https://movai-cobalt-1dbv.onrender.com/';
+const COBALT_TIMEOUT_MS = 120000; // free service sleeps when idle (~30-60s wake)
+const COBALT_DAILY_LIMIT = 20; // successful downloads/day per user (matches the key limit)
+const COBALT_KV_PREFIX = 'download-history:';
+const COBALT_MAX_HISTORY = 200; // entries kept per user (newest first)
+const COBALT_VIDEO_QUALITIES = ['144', '240', '360', '480', '720', '1080', '1440', '2160', '4320', 'max'];
+// True when an IP literal is private / loopback / link-local / reserved /
+// multicast — i.e. an address our server must never be tricked into
+// fetching (SSRF). Fail closed: anything unparsable counts as private.
+// IPv4 ranges: 0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.0/8 (incl.
+// 192.0.2 TEST-NET), 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24,
+// 224/4 (multicast), 240/4 (reserved). IPv6: ::1, ::, fe80::/10,
+// fc00::/7, ::ffff:<private-v4>.
+function cobaltIsPrivateIp(ip) {
+  if (typeof ip !== 'string' || !ip) return true;
+  // URL hostnames keep IPv6 brackets ("[::1]") — strip them first.
+  if (ip.charAt(0) === '[' && ip.charAt(ip.length - 1) === ']') ip = ip.slice(1, -1);
+  const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const o = v4.slice(1).map(Number);
+    if (o.some((n) => n > 255)) return true;
+    const a = o[0], b = o[1];
+    if (a === 0) return true;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 0) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true;
+    if (a === 198 && b === 51 && o[2] === 100) return true;
+    if (a === 203 && b === 0 && o[2] === 113) return true;
+    if (a >= 224) return true;
+    return false;
+  }
+  const v6 = ip.toLowerCase();
+  if (v6 === '::1' || v6 === '::' || v6 === '0:0:0:0:0:0:0:1' || v6 === '0:0:0:0:0:0:0:0') return true;
+  if (v6.indexOf('fe8') === 0 || v6.indexOf('fe9') === 0 || v6.indexOf('fea') === 0 || v6.indexOf('feb') === 0) return true;
+  if (v6.indexOf('fc') === 0 || v6.indexOf('fd') === 0) return true;
+  const mapped = v6.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (mapped) return cobaltIsPrivateIp(mapped[1]);
+  return false;
+}
+// Synchronous URL shape checks (no network): http/https only, no
+// credentials, no localhost / .local / single-label hosts, no literal
+// private IP, no non-default port, length cap. Returns
+// {ok:true, url} or {ok:false, error} (Khmer + English).
+function cobaltValidateUrlSync(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'សូមដាក់ link វីដេអូជាមុនសិន · Please paste a video link first' };
+  const s = raw.trim();
+  if (s.length > 2048) return { ok: false, error: 'Link វែងពេកទេ · Link is too long' };
+  let u;
+  try { u = new URL(s); } catch (e) { return { ok: false, error: 'Link មិនត្រឹមត្រូវទេ · Invalid link' }; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return { ok: false, error: 'Link ត្រូវតែចាប់ផ្ដើមដោយ http:// ឬ https:// · Link must start with http:// or https://' };
+  if (u.username || u.password) return { ok: false, error: 'Link មិនត្រូវមាន username/password ទេ · Link must not contain credentials' };
+  const host = (u.hostname || '').toLowerCase();
+  if (!host) return { ok: false, error: 'Link មិនត្រឹមត្រូវទេ · Invalid link' };
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.invalid') || host.endsWith('.test') || host.endsWith('.example')) {
+    return { ok: false, error: 'Link នេះប្រើមិនបានទេ · This link cannot be used' };
+  }
+  if (host.indexOf(':') !== -1) { // IPv6 literal (brackets stripped by URL)
+    if (cobaltIsPrivateIp(host)) return { ok: false, error: 'Link នេះចង្អុលទៅ server ខាងក្នុង · Link points to a private address' };
+  } else if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    if (cobaltIsPrivateIp(host)) return { ok: false, error: 'Link នេះចង្អុលទៅ server ខាងក្នុង · Link points to a private address' };
+  } else if (host.indexOf('.') === -1) {
+    return { ok: false, error: 'Link មិនត្រឹមត្រូវទេ · Invalid link' };
+  }
+  const defPort = u.protocol === 'https:' ? '443' : '80';
+  if (u.port && u.port !== defPort) return { ok: false, error: 'Link មាន port មិនធម្មតាទេ · Link has a non-standard port' };
+  return { ok: true, url: u.toString() };
+}
+// Full URL validation: sync checks + DNS resolution. A hostname that
+// resolves to a private address (DNS rebinding) is rejected too.
+// `lookup` is an injectable dns.promises.lookup (tests pass a stub);
+// when omitted it defaults to the real one. A lookup failure or
+// timeout fails CLOSED — Cobalt could not fetch that host either.
+async function cobaltValidateRemoteUrl(raw, lookup) {
+  const sync = cobaltValidateUrlSync(raw);
+  if (!sync.ok) return sync;
+  let lk = lookup;
+  if (!lk) { try { lk = require('dns').promises.lookup; } catch (e) { return { ok: false, error: 'រក host មិនឃើញទេ · Host could not be resolved' }; } }
+  const host = new URL(sync.url).hostname;
+  let addrs;
+  try {
+    const res = await Promise.race([
+      lk(host, { all: true }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('dns_timeout')), 10000)),
+    ]);
+    addrs = Array.isArray(res) ? res : [res];
+  } catch (e) { return { ok: false, error: 'រក host មិនឃើញទេ · Host could not be resolved' }; }
+  for (const a of addrs) {
+    const ip = (a && typeof a === 'object') ? a.address : a;
+    if (cobaltIsPrivateIp(ip)) return { ok: false, error: 'Link នេះចង្អុលទៅ server ខាងក្នុង · Link points to a private address' };
+  }
+  return { ok: true, url: sync.url };
+}
+// Platform guess from the URL host (for history + the client UI).
+function cobaltDetectPlatform(u) {
+  let host = '';
+  try { host = new URL(u).hostname.toLowerCase(); } catch (e) { return 'other'; }
+  if (host === 'youtu.be' || host.endsWith('.youtube.com') || host === 'youtube.com' || host.endsWith('.youtu.be')) return 'youtube';
+  if (host.endsWith('.tiktok.com') || host === 'tiktok.com') return 'tiktok';
+  if (host.endsWith('.facebook.com') || host === 'facebook.com' || host === 'fb.watch' || host.endsWith('.fb.watch')) return 'facebook';
+  if (host.endsWith('.instagram.com') || host === 'instagram.com') return 'instagram';
+  return 'other';
+}
+// Exact Cobalt v11 request bodies (see COBALT-PLAN.md). quality is
+// only used for mp4; unknown qualities fall back to 1080.
+function cobaltBuildCobaltBody(url, format, quality) {
+  if (format === 'mp3') {
+    return { url: url, downloadMode: 'audio', audioFormat: 'mp3', audioBitrate: '320', alwaysProxy: true };
+  }
+  const q = (typeof quality === 'string' && COBALT_VIDEO_QUALITIES.indexOf(quality) !== -1) ? quality : '1080';
+  return { url: url, downloadMode: 'auto', videoQuality: q, youtubeVideoContainer: 'mp4', alwaysProxy: true };
+}
+// Short stable codes for the known Cobalt error codes (unknown codes
+// pass through unchanged so the client can still show them).
+function cobaltShortCode(code) {
+  if (code === 'error.api.link.invalid' || code === 'error.api.link.unsupported') return 'invalid_link';
+  if (code === 'error.api.fetch.fail') return 'fetch_fail';
+  if (code === 'error.api.auth.key.invalid' || code === 'error.api.auth.key.missing') return 'cobalt_auth';
+  if (code === 'error.api.ratelimit') return 'cobalt_ratelimit';
+  return code || 'cobalt_error';
+}
+function cobaltErrorText(code, service) {
+  if (code === 'error.api.link.invalid' || code === 'error.api.link.unsupported') return 'Link នេះទាញយកមិនបានទេ · This link cannot be downloaded';
+  if (code === 'error.api.fetch.fail') return 'ទាញយកវីដេអូនេះមិនបានទេ — សូមព្យាយាមម្ដងទៀត · Could not fetch this video — please try again';
+  if (code === 'error.api.auth.key.invalid' || code === 'error.api.auth.key.missing') return 'Download Center មិនទាន់កំណត់រួចទេ · Download Center is not configured yet';
+  if (code === 'error.api.ratelimit') return 'សូមរង់ចាំបន្តិច រួចព្យាយាមម្ដងទៀត · Please wait a moment and try again';
+  return 'ទាញយកមិនបានទេ (' + String(code || 'cobalt_error').slice(0, 80) + ') · Download failed (' + String(code || 'cobalt_error').slice(0, 80) + ')';
+}
+// Map a Cobalt v11 response to what the client needs. `validateUrl`
+// must be an async (url) => {ok, url} checker (the handler passes
+// cobaltValidateRemoteUrl) — tunnel AND redirect URLs are validated
+// before they are ever returned, so a bad/compromised instance cannot
+// hand the client a private/internal URL.
+async function cobaltMapCobaltResponse(data, validateUrl) {
+  if (!data || typeof data !== 'object' || typeof data.status !== 'string') {
+    return { ok: false, code: 'cobalt_bad_response', error: 'Cobalt server ឆ្លើយមិនត្រឹមត្រូវទេ · Cobalt server gave a bad response' };
+  }
+  const st = data.status;
+  if (st === 'tunnel' || st === 'redirect') {
+    if (typeof data.url !== 'string' || !data.url) {
+      return { ok: false, code: 'cobalt_bad_response', error: 'Cobalt server ឆ្លើយមិនត្រឹមត្រូវទេ · Cobalt server gave a bad response' };
+    }
+    const v = await validateUrl(data.url);
+    if (!v.ok) return { ok: false, code: 'unsafe_url', error: 'Cobalt បានផ្ដល់ link មិនមានសុវត្ថិភាពទេ · Cobalt returned an unsafe link' };
+    return { ok: true, kind: st, url: v.url, filename: typeof data.filename === 'string' ? data.filename : '' };
+  }
+  if (st === 'picker') {
+    return { ok: true, kind: 'picker', picker: Array.isArray(data.picker) ? data.picker : [], audio: typeof data.audio === 'string' ? data.audio : '' };
+  }
+  if (st === 'local-processing') {
+    return { ok: true, kind: 'local-processing', cobalt: data };
+  }
+  if (st === 'error') {
+    const err = (data.error && typeof data.error === 'object') ? data.error : {};
+    const code = typeof err.code === 'string' ? err.code : 'cobalt_error';
+    const service = (err.context && typeof err.context.service === 'string') ? err.context.service : '';
+    // YouTube blocked our datacenter IP — NEVER hide this inside a
+    // generic error: the frontend keys its phone-direct fallback on
+    // this exact code.
+    if (code === 'error.api.fetch.fail' && service === 'youtube') {
+      return { ok: false, code: 'youtube_blocked', error: 'YouTube ប្លុក server របស់យើង (IP server) — សូមប្រើវិធីទូរសព្ទ (phone-direct) ដែលនឹងមកក្នុង Download Center · YouTube blocked our server IP — use the phone-direct method coming in the Download Center' };
+    }
+    return { ok: false, code: cobaltShortCode(code), error: cobaltErrorText(code, service) };
+  }
+  return { ok: false, code: 'cobalt_bad_response', error: 'Cobalt server ឆ្លើយមិនត្រឹមត្រូវទេ · Cobalt server gave a bad response' };
+}
+// POST our Cobalt instance. `fetchFn` is an injectable fetch (tests
+// pass a stub); when omitted the global fetch is used. The API key is
+// read from env at call time and used ONLY in the Authorization header
+// — it is never logged, never returned, never stored.
+async function cobaltCallCobalt(body, fetchFn) {
+  const key = (process.env.COBALT_API_KEY || '').trim();
+  if (!key) return { ok: false, code: 'server_not_configured', error: 'Download Center មិនទាន់កំណត់រួចទេ · Download Center is not configured yet' };
+  const f = fetchFn || fetch;
+  let r;
+  try {
+    r = await f(COBALT_BASE_URL, {
+      method: 'POST',
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Authorization': 'Api-Key ' + key },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(COBALT_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const msg = String((e && e.name) || '') + ' ' + String((e && e.message) || '');
+    if (/abort|timeout/i.test(msg)) return { ok: false, code: 'cobalt_timeout', error: 'Server កំពុងភ្ញាក់ (sleep) — សូមព្យាយាមម្ដងទៀត · Server is waking up — please try again' };
+    return { ok: false, code: 'cobalt_unreachable', error: 'ភ្ជាប់ទៅ server ទាញយកមិនបានទេ — សូមព្យាយាមម្ដងទៀត · Could not reach the download server — please try again' };
+  }
+  let j = null;
+  try { j = await r.json(); } catch (e) { j = null; }
+  if (!j || typeof j !== 'object') return { ok: false, code: 'cobalt_bad_response', error: 'Cobalt server ឆ្លើយមិនត្រឹមត្រូវទេ · Cobalt server gave a bad response' };
+  return { ok: true, status: r.status, data: j };
+}
+// ---- Download history (Supabase kv_docs, one row per user) ----
+function cobaltHistoryKey(email) { return COBALT_KV_PREFIX + email; }
+async function cobaltLoadHistory(email) {
+  const arr = await loadKvDoc(cobaltHistoryKey(email), []);
+  return Array.isArray(arr) ? arr : [];
+}
+// Successful downloads today (Phnom Penh day, `date` field). Only
+// status 'ok' (tunnel/redirect) counts — a picker, a YouTube block or
+// any other failure costs the user nothing.
+async function cobaltDailyOkCount(email, today) {
+  const items = await cobaltLoadHistory(email);
+  let n = 0;
+  for (const it of items) {
+    if (!it || typeof it !== 'object') continue;
+    if (it.status === 'ok' && it.date === today) n++;
+  }
+  return n;
+}
+async function cobaltRecordHistory(email, item) {
+  try {
+    const items = await cobaltLoadHistory(email);
+    items.unshift(item);
+    await saveKvDoc(cobaltHistoryKey(email), items.slice(0, COBALT_MAX_HISTORY));
+  } catch (e) {}
+}
+// POST /api/download/resolve — {email, url, format, quality}.
+// Signed-in users only (same check as /api/gen/image: a real email
+// that exists in the users table). FREE, 0 credits. `hooks` is a TEST
+// SEAM only ({lookup, fetchFn}) — the apiRoute branch never passes it.
+// Every response is sendJSON 200 with {ok} like the rest of this file.
+async function cobaltHandleDownloadResolve(req, res, body, hooks) {
+  const hookLookup = hooks && hooks.lookup;
+  const hookFetch = hooks && hooks.fetchFn;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return sendJSON(res, 200, { ok: false, error: 'ទិន្នន័យមិនត្រឹមត្រូវទេ · Bad request' });
+  }
+  const email = normEmail(body.email);
+  if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
+  const users = await loadUsers();
+  if (!users || !users[email]) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
+  let format = 'mp4';
+  if (typeof body.format === 'string' && body.format.trim()) {
+    const f = body.format.trim().toLowerCase();
+    if (f !== 'mp4' && f !== 'mp3') return sendJSON(res, 200, { ok: false, error: 'format ត្រូវតែជា mp4 ឬ mp3 · format must be mp4 or mp3' });
+    format = f;
+  }
+  let quality = '1080';
+  if (typeof body.quality === 'string' && body.quality.trim()) {
+    const q = body.quality.trim();
+    if (COBALT_VIDEO_QUALITIES.indexOf(q) !== -1) quality = q;
+  }
+  if (format === 'mp3') quality = '320'; // mp3 uses audioBitrate 320, not a video quality
+  const rawUrl = typeof body.url === 'string' ? body.url.trim() : '';
+  if (!rawUrl) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ link វីដេអូជាមុនសិន · Please paste a video link first' });
+  const checked = await cobaltValidateRemoteUrl(rawUrl, hookLookup);
+  if (!checked.ok) return sendJSON(res, 200, { ok: false, error: checked.error });
+  const url = checked.url;
+  const platform = cobaltDetectPlatform(url);
+  const today = imgFreeTodayDate(); // Phnom Penh YYYY-MM-DD (same helper as the free-image counter)
+  const used = await cobaltDailyOkCount(email, today);
+  if (used >= COBALT_DAILY_LIMIT) {
+    return sendJSON(res, 200, { ok: false, code: 'daily_limit', error: 'ទាញយកបាន 20 ដង/ថ្ងៃ — អស់ហើយថ្ងៃនេះ (' + used + '/20) នឹងបានម្ដងទៀតនៅថ្ងៃស្អែក · 20 downloads per day — used up for today (' + used + '/20), free again tomorrow', daily: { used: used, limit: COBALT_DAILY_LIMIT, left: 0 } });
+  }
+  const cobBody = cobaltBuildCobaltBody(url, format, quality);
+  const called = await cobaltCallCobalt(cobBody, hookFetch);
+  const base = { id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), url: url, platform: platform, format: format, quality: quality, filename: '', createdAt: new Date().toISOString(), date: today, creditUsed: 0 };
+  if (!called.ok) {
+    await cobaltRecordHistory(email, Object.assign({}, base, { status: 'error', error: called.error }));
+    return sendJSON(res, 200, { ok: false, code: called.code, error: called.error });
+  }
+  const mapped = await cobaltMapCobaltResponse(called.data, (u) => cobaltValidateRemoteUrl(u, hookLookup));
+  if (!mapped.ok) {
+    await cobaltRecordHistory(email, Object.assign({}, base, { status: mapped.code === 'youtube_blocked' ? 'youtube_blocked' : 'error', error: mapped.error }));
+    return sendJSON(res, 200, { ok: false, code: mapped.code, error: mapped.error });
+  }
+  const status = (mapped.kind === 'tunnel' || mapped.kind === 'redirect') ? 'ok' : mapped.kind;
+  await cobaltRecordHistory(email, Object.assign({}, base, { status: status, filename: mapped.filename || '', error: '' }));
+  const usedNow = status === 'ok' ? used + 1 : used;
+  return sendJSON(res, 200, { ok: true, kind: mapped.kind, url: mapped.url || '', filename: mapped.filename || '', picker: mapped.picker || null, audio: mapped.audio || '', cobalt: mapped.cobalt || null, platform: platform, format: format, quality: quality, creditUsed: 0, daily: { used: usedNow, limit: COBALT_DAILY_LIMIT, left: Math.max(0, COBALT_DAILY_LIMIT - usedNow) } });
+}
+/* __COBALT_BLOCK_END__ */
 async function apiRoute(req, res, urlPath) {
   // One Cloudinary upload at a time (serialised through _cloudQueue).
   // MUST stay at the TOP of apiRoute: cloudinaryStoreSong is called from
@@ -5353,6 +5652,20 @@ async function apiRoute(req, res, urlPath) {
       } catch (e) { return stored.url; }
       return wm;
     } catch (e) { console.error('[watermark] failed:', String((e && e.message) || e).slice(0, 200)); return null; }
+  }
+  // ---- Download Center (Cobalt) — Phase 2 (owner order 2026-11-23) ----
+  // POST /api/download/resolve — {email, url, format, quality} →
+  // {ok, kind, url, filename, picker, audio, daily, creditUsed:0}.
+  // Signed-in users only, FREE (0 credits), 20 successful downloads/day
+  // per user. All logic lives in cobaltHandleDownloadResolve (module
+  // scope, above apiRoute) so this branch only reads the body and calls
+  // it — nothing else in this file is touched.
+  if (req.method === 'POST' && urlPath === '/api/download/resolve') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      try { await cobaltHandleDownloadResolve(req, res, body); }
+      catch (e) { try { sendJSON(res, 200, { ok: false, error: 'Download Center មានបញ្ហា — សូមព្យាយាមម្ដងទៀត · Download Center error — please try again' }); } catch (e2) {} }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
   }
   if (req.method === 'POST' && urlPath === '/api/gen/image') {
     const genCtx = { provider: '', email: '' };
