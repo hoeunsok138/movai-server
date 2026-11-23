@@ -5720,7 +5720,7 @@ async function apiRoute(req, res, urlPath) {
           const _en = await translateImgPromptToEnglish(bg);
           if (_en) bg = _en.slice(0, 500);
         }
-        const editPrompt = 'Follow this edit instruction exactly, changing only what it asks for and keeping everything else in the photo unchanged: ' + bg + '. Photorealistic, natural lighting, seamless blend, highly detailed, sharp focus.';
+        const editPrompt = 'Follow this edit instruction exactly. Keep the EXACT same person — same face, same identity, same clothes, same pose, same body position — do not change the person in any way. Change ONLY the background as instructed, and the new background must be a real scene, never a solid colour and never a plain backdrop: ' + bg + '. Photorealistic, natural lighting, seamless blend, highly detailed, sharp focus.';
         const EDIT_MODEL = 'nano-banana-2.1';
         const EDIT_COST = 50;
         const editAspect = /9\s*:\s*16/.test(bg) ? '9:16' : /16\s*:\s*9/.test(bg) ? '16:9' : /1\s*:\s*1/.test(bg) ? '1:1' : 'auto';
