@@ -5095,6 +5095,7 @@ let _healStarted = false; // startup song-URL heal runs once (see apiRoute top)
    hidden inside a generic error. */
 const COBALT_BASE_URL = 'https://movai-cobalt-1dbv.onrender.com/';
 const COBALT_TIMEOUT_MS = 120000; // free service sleeps when idle (~30-60s wake)
+const COBALT_RETRY_WAIT_MS = 20000; // wait before the ONE retry below (free service mid-boot)
 const COBALT_DAILY_LIMIT = 20; // successful downloads/day per user (matches the key limit)
 const COBALT_KV_PREFIX = 'download-history:';
 const COBALT_MAX_HISTORY = 200; // entries kept per user (newest first)
@@ -5266,27 +5267,65 @@ async function cobaltMapCobaltResponse(data, validateUrl) {
 // pass a stub); when omitted the global fetch is used. The API key is
 // read from env at call time and used ONLY in the Authorization header
 // — it is never logged, never returned, never stored.
-async function cobaltCallCobalt(body, fetchFn) {
+// RETRY (2026-11-23, live bug): the free Cobalt service sleeps after
+// ~15 min idle, and the first call often hits it mid-boot and gets a
+// non-JSON answer. So a transport-level failure (fetch throws, times
+// out, or returns a non-JSON body) waits 20s and retries EXACTLY ONCE
+// with the same body/headers. `retryWaitMs` overrides the wait (tests
+// pass 0 so they stay fast); production always waits the full 20s.
+async function cobaltCallCobalt(body, fetchFn, retryWaitMs) {
   const key = (process.env.COBALT_API_KEY || '').trim();
   if (!key) return { ok: false, code: 'server_not_configured', error: 'Download Center មិនទាន់កំណត់រួចទេ · Download Center is not configured yet' };
   const f = fetchFn || fetch;
-  let r;
-  try {
-    r = await f(COBALT_BASE_URL, {
-      method: 'POST',
-      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Authorization': 'Api-Key ' + key },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(COBALT_TIMEOUT_MS),
-    });
-  } catch (e) {
-    const msg = String((e && e.name) || '') + ' ' + String((e && e.message) || '');
-    if (/abort|timeout/i.test(msg)) return { ok: false, code: 'cobalt_timeout', error: 'Server កំពុងភ្ញាក់ (sleep) — សូមព្យាយាមម្ដងទៀត · Server is waking up — please try again' };
-    return { ok: false, code: 'cobalt_unreachable', error: 'ភ្ជាប់ទៅ server ទាញយកមិនបានទេ — សូមព្យាយាមម្ដងទៀត · Could not reach the download server — please try again' };
+  const waitMs = (typeof retryWaitMs === 'number' && retryWaitMs >= 0) ? retryWaitMs : COBALT_RETRY_WAIT_MS;
+  async function attempt() {
+    let r;
+    try {
+      r = await f(COBALT_BASE_URL, {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Authorization': 'Api-Key ' + key },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(COBALT_TIMEOUT_MS),
+      });
+    } catch (e) {
+      const msg = String((e && e.name) || '') + ' ' + String((e && e.message) || '');
+      if (/abort|timeout/i.test(msg)) return { ok: false, code: 'cobalt_timeout', error: 'Server កំពុងភ្ញាក់ (sleep) — សូមព្យាយាមម្ដងទៀត · Server is waking up — please try again' };
+      return { ok: false, code: 'cobalt_unreachable', error: 'ភ្ជាប់ទៅ server ទាញយកមិនបានទេ — សូមព្យាយាមម្ដងទៀត · Could not reach the download server — please try again' };
+    }
+    let j = null;
+    try { j = await r.json(); } catch (e) { j = null; }
+    if (!j || typeof j !== 'object') return { ok: false, code: 'cobalt_bad_response', error: 'Cobalt server ឆ្លើយមិនត្រឹមត្រូវទេ · Cobalt server gave a bad response' };
+    return { ok: true, status: r.status, data: j };
   }
-  let j = null;
-  try { j = await r.json(); } catch (e) { j = null; }
-  if (!j || typeof j !== 'object') return { ok: false, code: 'cobalt_bad_response', error: 'Cobalt server ឆ្លើយមិនត្រឹមត្រូវទេ · Cobalt server gave a bad response' };
-  return { ok: true, status: r.status, data: j };
+  const first = await attempt();
+  if (first.ok) return first;
+  await new Promise(function (res) { setTimeout(res, waitMs); });
+  return attempt();
+}
+// GET /api/download/wake — best-effort wake-up ping for the free Cobalt
+// service (owner order 2026-11-23: wake it when the Download Center
+// page opens, so it is already awake when the user taps Download).
+// `fetchFn` is an injectable fetch (tests pass a stub); when omitted the
+// global fetch is used. No sign-in, no key, no history, no daily limit.
+// NEVER throws and NEVER returns an error: any failure still answers
+// {ok:true, cobalt:'waking'} — the client just carries on, and the
+// retry + phone-direct fallback cover the Download tap. "awake" only
+// when the Cobalt root answers with real JSON.
+async function cobaltWakeCobalt(fetchFn) {
+  const f = fetchFn || fetch;
+  try {
+    const r = await f(COBALT_BASE_URL, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(30000),
+    });
+    let j = null;
+    try { j = await r.json(); } catch (e) { j = null; }
+    if (j && typeof j === 'object') return { ok: true, cobalt: 'awake' };
+    return { ok: true, cobalt: 'waking' };
+  } catch (e) {
+    return { ok: true, cobalt: 'waking' };
+  }
 }
 // ---- Download history (Supabase kv_docs, one row per user) ----
 function cobaltHistoryKey(email) { return COBALT_KV_PREFIX + email; }
@@ -5296,15 +5335,28 @@ async function cobaltLoadHistory(email) {
 }
 // Successful downloads today (Phnom Penh day, `date` field). Only
 // status 'ok' (tunnel/redirect) counts — a picker, a YouTube block or
-// any other failure costs the user nothing.
+// any other failure costs the user nothing. The limit counts DISTINCT
+// video URLs, not resolve calls: one video = one count, no matter how
+// many formats the user checks (START resolves MP4 + MP3, More formats
+// resolves more qualities — all of the same video are free after the
+// first). Re-opening a video counted today is always allowed, even at
+// the limit; only a NEW video is blocked.
 async function cobaltDailyOkCount(email, today) {
   const items = await cobaltLoadHistory(email);
-  let n = 0;
+  const seen = new Set();
   for (const it of items) {
     if (!it || typeof it !== 'object') continue;
-    if (it.status === 'ok' && it.date === today) n++;
+    if (it.status === 'ok' && it.date === today && typeof it.url === 'string') seen.add(it.url);
   }
-  return n;
+  return seen.size;
+}
+async function cobaltUrlCountedToday(email, url, today) {
+  const items = await cobaltLoadHistory(email);
+  for (const it of items) {
+    if (!it || typeof it !== 'object') continue;
+    if (it.status === 'ok' && it.date === today && it.url === url) return true;
+  }
+  return false;
 }
 async function cobaltRecordHistory(email, item) {
   try {
@@ -5348,11 +5400,12 @@ async function cobaltHandleDownloadResolve(req, res, body, hooks) {
   const platform = cobaltDetectPlatform(url);
   const today = imgFreeTodayDate(); // Phnom Penh YYYY-MM-DD (same helper as the free-image counter)
   const used = await cobaltDailyOkCount(email, today);
-  if (used >= COBALT_DAILY_LIMIT) {
+  const alreadyCounted = await cobaltUrlCountedToday(email, url, today);
+  if (!alreadyCounted && used >= COBALT_DAILY_LIMIT) {
     return sendJSON(res, 200, { ok: false, code: 'daily_limit', error: 'ទាញយកបាន 20 ដង/ថ្ងៃ — អស់ហើយថ្ងៃនេះ (' + used + '/20) នឹងបានម្ដងទៀតនៅថ្ងៃស្អែក · 20 downloads per day — used up for today (' + used + '/20), free again tomorrow', daily: { used: used, limit: COBALT_DAILY_LIMIT, left: 0 } });
   }
   const cobBody = cobaltBuildCobaltBody(url, format, quality);
-  const called = await cobaltCallCobalt(cobBody, hookFetch);
+  const called = await cobaltCallCobalt(cobBody, hookFetch, hooks && hooks.retryWaitMs);
   const base = { id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), url: url, platform: platform, format: format, quality: quality, filename: '', createdAt: new Date().toISOString(), date: today, creditUsed: 0 };
   if (!called.ok) {
     await cobaltRecordHistory(email, Object.assign({}, base, { status: 'error', error: called.error }));
@@ -5365,7 +5418,7 @@ async function cobaltHandleDownloadResolve(req, res, body, hooks) {
   }
   const status = (mapped.kind === 'tunnel' || mapped.kind === 'redirect') ? 'ok' : mapped.kind;
   await cobaltRecordHistory(email, Object.assign({}, base, { status: status, filename: mapped.filename || '', error: '' }));
-  const usedNow = status === 'ok' ? used + 1 : used;
+  const usedNow = (status === 'ok' && !alreadyCounted) ? used + 1 : used;
   return sendJSON(res, 200, { ok: true, kind: mapped.kind, url: mapped.url || '', filename: mapped.filename || '', picker: mapped.picker || null, audio: mapped.audio || '', cobalt: mapped.cobalt || null, platform: platform, format: format, quality: quality, creditUsed: 0, daily: { used: usedNow, limit: COBALT_DAILY_LIMIT, left: Math.max(0, COBALT_DAILY_LIMIT - usedNow) } });
 }
 /* __COBALT_BLOCK_END__ */
@@ -5665,6 +5718,15 @@ async function apiRoute(req, res, urlPath) {
       try { await cobaltHandleDownloadResolve(req, res, body); }
       catch (e) { try { sendJSON(res, 200, { ok: false, error: 'Download Center មានបញ្ហា — សូមព្យាយាមម្ដងទៀត · Download Center error — please try again' }); } catch (e2) {} }
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  // GET /api/download/wake — wake the free Cobalt service when the
+  // Download Center page opens (owner order 2026-11-23). Best-effort,
+  // no sign-in, never errors: always sendJSON 200 {ok:true,
+  // cobalt:'awake'|'waking'}.
+  if (req.method === 'GET' && urlPath === '/api/download/wake') {
+    cobaltWakeCobalt().then((r) => { try { sendJSON(res, 200, r); } catch (e) {} })
+      .catch(() => { try { sendJSON(res, 200, { ok: true, cobalt: 'waking' }); } catch (e2) {} });
     return;
   }
   if (req.method === 'POST' && urlPath === '/api/gen/image') {
