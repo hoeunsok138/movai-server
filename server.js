@@ -1515,7 +1515,7 @@ function newNotificationId() {
 function tgEsc(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-const PKG_DISPLAY_NAME = { monthly: 'Monthly', yearly: 'Yearly', 'song-trial': 'Song Trial', 'song-popular': 'Song Popular', 'song-30': 'Song Pro 30', 'song-50': 'Song Max 50', 'song-pro': 'Song Pro' };
+const PKG_DISPLAY_NAME = { monthly: 'Monthly', yearly: 'Yearly', 'song-trial': 'Song Trial', 'song-popular': 'Song Popular', 'song-30': 'Song Pro 30', 'song-50': 'Song Max 50', 'song-pro': 'Song Pro', starter: 'Starter', pro: 'Pro', premium: 'Premium' };
 function pkgDisplay(pkg) {
   if (!pkg || typeof pkg !== 'object') return { pkgName: '', priceText: '', creditText: '' };
   const days = numOr(pkg.days, 30);
@@ -11041,8 +11041,11 @@ async function apiRoute(req, res, urlPath) {
     'song-30': { credits: 0, songCredits: 4000, days: 30, price: 30 },
     'song-50': { credits: 0, songCredits: 7200, days: 30, price: 50 },
     'song-pro': { credits: 0, songCredits: 3750, days: 30, price: 22 },
+    starter: { credits: 0, songCredits: 550, days: 30, price: 4.99 },
+    pro: { credits: 0, songCredits: 1120, days: 30, price: 9.99 },
+    premium: { credits: 0, songCredits: 2360, days: 30, price: 18.99 },
   };
-  const PACKAGE_ORDER = ['monthly', 'yearly', 'song-trial', 'song-popular', 'song-30', 'song-50', 'song-pro'];
+  const PACKAGE_ORDER = ['monthly', 'yearly', 'song-trial', 'song-popular', 'song-30', 'song-50', 'song-pro', 'starter', 'pro', 'premium'];
   const PACKAGES_FILE = path.join(DATA_DIR, 'packages.json');
   function cleanPackages(j) {
     const out = {};
@@ -11389,6 +11392,8 @@ async function apiRoute(req, res, urlPath) {
       const email = normEmail(body && body.email);
       if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ Gmail ត្រឹមត្រូវ' });
       const kind = typeof body.kind === 'string' ? body.kind.trim().toLowerCase() : 'package';
+      const _m = typeof body.method === 'string' ? body.method.trim().toLowerCase() : '';
+      const payMethod = _m === 'khqr' || _m === 'usdt' ? _m : '';
       let packageId = '', pkg = null, feature = '', postType = '', discLabel = '';
       if (kind === 'discount') {
         feature = typeof body.feature === 'string' ? body.feature.trim().toLowerCase() : '';
@@ -11404,7 +11409,7 @@ async function apiRoute(req, res, urlPath) {
       const now = new Date().toISOString();
       const reqs = await loadPurchaseRequests();
       const r = {
-        id: newPurchaseId(), email, packageId,
+        id: newPurchaseId(), email, packageId, method: payMethod,
         kind: kind === 'discount' ? 'discount' : 'package',
         feature: kind === 'discount' ? feature : '',
         postType: kind === 'discount' ? postType : '',
@@ -11414,6 +11419,7 @@ async function apiRoute(req, res, urlPath) {
         receiptUrl: typeof body.receiptUrl === 'string' ? body.receiptUrl.trim().slice(0, 500) : '',
         status: 'pending', createdAt: now, updatedAt: now,
       };
+      r.dupReceipt = !!r.receiptUrl && reqs.some((x) => x.receiptUrl && x.receiptUrl === r.receiptUrl);
       reqs.push(r);
       await savePurchaseRequests(reqs);
       const _pu = (await loadUsers())[email];
@@ -11427,6 +11433,41 @@ async function apiRoute(req, res, urlPath) {
       return sendJSON(res, 200, { ok: true, request: r });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
+  }
+  // POST /api/public/purchase-event — PUBLIC (no admin key). Records one
+  // step of the credit-package buy funnel so the admin can see who viewed a
+  // package, chose a method, saw the QR, uploaded a receipt, sent the
+  // request, or left without paying. Body: {email, packageId, step, method}.
+  // Steps: viewed | method | qr | receipt | sent | abandoned. Capped at
+  // 2000 newest events in kv_docs 'purchase-events'.
+  if (req.method === 'POST' && urlPath === '/api/public/purchase-event') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      const email = normEmail(body && body.email);
+      if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ Gmail ត្រឹមត្រូវ' });
+      const packageId = typeof body.packageId === 'string' ? body.packageId.trim().slice(0, 40) : '';
+      const step = typeof body.step === 'string' ? body.step.trim().toLowerCase().slice(0, 20) : '';
+      const steps = ['viewed', 'method', 'qr', 'receipt', 'sent', 'abandoned'];
+      if (!packageId || steps.indexOf(step) < 0) return sendJSON(res, 200, { ok: false, error: 'ទិន្នន័យមិនត្រឹមត្រូវទេ' });
+      const _m = typeof body.method === 'string' ? body.method.trim().toLowerCase() : '';
+      const payMethod = _m === 'khqr' || _m === 'usdt' ? _m : '';
+      const ev = { id: 'pe_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), email, packageId, step, method: payMethod, at: new Date().toISOString() };
+      const list = await loadKvDoc('purchase-events', []);
+      const arr = Array.isArray(list) ? list : [];
+      arr.push(ev);
+      const capped = arr.length > 2000 ? arr.slice(arr.length - 2000) : arr;
+      await saveKvDoc('purchase-events', capped, 'purchase-events.json');
+      return sendJSON(res, 200, { ok: true, event: ev });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  // GET /api/admin/purchase-events?limit=200 — admin key required. Newest first.
+  if (req.method === 'GET' && urlPath === '/api/admin/purchase-events') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    const limit = Math.min(Math.max(parseInt(new URL(req.url, 'http://localhost').searchParams.get('limit') || '200', 10) || 200, 1), 500);
+    const list = await loadKvDoc('purchase-events', []);
+    const arr = Array.isArray(list) ? list : [];
+    return sendJSON(res, 200, { ok: true, events: arr.slice().reverse().slice(0, limit) });
   }
   // GET /api/admin/purchase-requests?status=pending|approved|rejected|all
   // — admin key required. Pending first, then newest first.
