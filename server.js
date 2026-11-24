@@ -481,14 +481,32 @@ if (_backupInterval && typeof _backupInterval.unref === 'function') { try { _bac
 // blocked do not count tries or extend the block. Manual blocks in
 // blocked-ips.json stay permanent and are checked separately.
 const ADMIN_LOCKOUTS_FILE = path.join(DATA_DIR, 'admin-lockouts.json');
-const LOCKOUT_LEVELS = [
-  { tries: 4, mins: 5 },
-  { tries: 3, mins: 20 },
-  { tries: 2, mins: 60 },
-  { tries: 1, mins: 720 },
-];
-function lockoutLevelCfg(level) {
-  return LOCKOUT_LEVELS[Math.min(Math.max(level, 1) - 1, LOCKOUT_LEVELS.length - 1)];
+// Admin lockout levels (owner order 2026-11-22, refined 2026-11-24).
+// Block minutes per level are FIXED: 5, 20, 60, 720. The tries per level
+// derive from the Admin setting maxLoginAttempts (default 4, valid 1-10):
+// L1 = max, L2 = max(1, max-1), L3 = max(1, max-2), L4 = 1. The setting
+// is read FRESH from settings on every check (maxLoginAttempts()) so an
+// Admin change takes effect immediately. Invalid stored values fall back
+// to 4 (normMaxLoginAttempts) — the lockout never breaks on bad data.
+const LOCKOUT_MINS = [5, 20, 60, 720];
+const MAX_LOGIN_ATTEMPTS_DEFAULT = 4;
+const MAX_LOGIN_ATTEMPTS_MIN = 1;
+const MAX_LOGIN_ATTEMPTS_MAX = 10;
+function normMaxLoginAttempts(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return MAX_LOGIN_ATTEMPTS_DEFAULT;
+  const i = Math.floor(n);
+  if (i < MAX_LOGIN_ATTEMPTS_MIN || i > MAX_LOGIN_ATTEMPTS_MAX) return MAX_LOGIN_ATTEMPTS_DEFAULT;
+  return i;
+}
+async function maxLoginAttempts() {
+  try { const s = await loadSettings(); return normMaxLoginAttempts(s && s.maxLoginAttempts); } catch (e) { return MAX_LOGIN_ATTEMPTS_DEFAULT; }
+}
+function lockoutLevelCfg(level, maxTries) {
+  const max = normMaxLoginAttempts(maxTries);
+  const tries = [max, Math.max(1, max - 1), Math.max(1, max - 2), 1];
+  const idx = Math.min(Math.max(level, 1) - 1, LOCKOUT_MINS.length - 1);
+  return { tries: tries[idx], mins: LOCKOUT_MINS[idx] };
 }
 async function loadAdminLockouts() {
   const j = await loadKvDoc('admin-lockouts', {});
@@ -542,8 +560,8 @@ async function recordFailedAdminAttempt(req, ip) {
     if (!rec || typeof rec !== 'object') rec = { level: 1, tries: 0, blockedUntil: 0, model: '' };
     // Already inside a lockout: do not extend it, do not count tries.
     if (rec.blockedUntil && rec.blockedUntil > now) return 0;
-    const level = Math.min(Math.max(rec.level || 1, 1), LOCKOUT_LEVELS.length);
-    const cfg = lockoutLevelCfg(level);
+    const level = Math.min(Math.max(rec.level || 1, 1), LOCKOUT_MINS.length);
+    const cfg = lockoutLevelCfg(level, await maxLoginAttempts());
     rec.tries = (rec.tries || 0) + 1;
     rec.level = level;
     const model = modelFromUA(req.headers && req.headers['user-agent']);
@@ -552,7 +570,7 @@ async function recordFailedAdminAttempt(req, ip) {
       // Level reached: block for this level's duration, advance a level.
       rec.blockedUntil = now + cfg.mins * 60 * 1000;
       rec.tries = 0;
-      rec.level = Math.min(level + 1, LOCKOUT_LEVELS.length);
+      rec.level = Math.min(level + 1, LOCKOUT_MINS.length);
       rec.updatedAt = new Date().toISOString();
       all[ip] = rec;
       await saveAdminLockouts(all);
@@ -624,7 +642,7 @@ async function adminKeyOk(req) {
   try {
     const rec = (await loadAdminLockouts())[ip];
     if (rec) {
-      const cfg = lockoutLevelCfg(rec.level || 1);
+      const cfg = lockoutLevelCfg(rec.level || 1, await maxLoginAttempts());
       const left = Math.max(0, cfg.tries - (rec.tries || 0));
       return { ok: false, error: 'Admin key មិនត្រឹមត្រូវទេ (នៅសល់ ' + left + ' ដង) · Wrong admin key (' + left + ' ' + (left === 1 ? 'try' : 'tries') + ' left)' };
     }
@@ -2155,6 +2173,11 @@ const SETTINGS_DEFAULTS = {
   // levels; when false the admin key is still required for every admin
   // call, but no IP is ever blocked for wrong keys.
   lockoutEnabled: true,
+  // Max wrong Admin login attempts before the first block (owner order
+  // 2026-11-24). Level tries derive from it: L1 = max, L2 = max-1 (min 1),
+  // L3 = max-2 (min 1), L4 = 1. Block minutes stay 5/20/60/720.
+  // Default 4, valid 1-10; invalid stored values fall back to 4.
+  maxLoginAttempts: 4,
   // Device account-limit toggle (owner order 2026-11-18). deviceLimitEnabled
   // (default OFF) = enforce the free-account limit at registration;
   // deviceLimit (default 3) = how many free Google accounts one device
@@ -2254,6 +2277,11 @@ function cleanSettings(j, base) {
   if (typeof j.autoCatch === 'boolean') s.autoCatch = j.autoCatch;
   // Admin Lockout protection toggle (owner order 2026-11-22). Default ON.
   if (typeof j.lockoutEnabled === 'boolean') s.lockoutEnabled = j.lockoutEnabled;
+  // Max wrong login attempts (owner order 2026-11-24). Only a whole
+  // number 1-10 is accepted; anything else (0, 99, "x", missing) keeps
+  // the stored value — the default 4 when loading fresh. The Admin
+  // input enforces min 1 / max 10.
+  if (Number.isFinite(j.maxLoginAttempts)) { const _m = Math.floor(j.maxLoginAttempts); if (_m >= 1 && _m <= 10) s.maxLoginAttempts = _m; }
   // Device account-limit toggle (owner order 2026-11-18). enabled is a
   // boolean; limit is a whole number 1-100 (default 3). Invalid values
   // keep the stored value.
