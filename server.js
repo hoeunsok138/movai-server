@@ -2567,7 +2567,7 @@ async function keyHealthList() {
   // Also include providers that have keys configured but no health record
   // yet (shown as 'unknown' until first use).
   try {
-    for (const p of ['suno', 'magichour', 'musicapi', 'novai', 'groq', 'mvsep', 'agnes']) {
+    for (const p of ['suno', 'magichour', 'musicapi', 'novai', 'groq', 'mvsep', 'agnes', 'disband', 'doseedo']) {
       const n = (await adminProviderKeyList(p)).length;
       if (!n) continue;
       if (!out[p]) out[p] = [];
@@ -4312,6 +4312,21 @@ async function withProviderKeyRotation(provider, fn, reqKey, candidatesOverride)
     });
     if (fresh.length) order = fresh;
   }
+  // SKIP-BROKEN (owner order 2026-11-24 20:35, ALL providers): a key
+  // whose key-health is broken/exhausted/busy/closed from a previous
+  // failure is skipped immediately — never tried, never waited on.
+  // Only healthy ('ok') or never-tried ('unknown'/no record) keys are
+  // attempted. If EVERY key is broken, try them anyway in rotation
+  // order (a quota may have reset since it was marked; the existing
+  // wrap-around recovery depends on this). Composes with the MVSEP
+  // nearly-exhausted filter above and with the sticky start.
+  await keyHealthEnsure();
+  const _healthyOrder = order.filter((idx) => {
+    const _h = _keyHealth[p] && _keyHealth[p][String(idx)];
+    const _st = _h && typeof _h.status === 'string' ? _h.status : 'unknown';
+    return _st === 'ok' || _st === 'unknown';
+  });
+  if (_healthyOrder.length) order = _healthyOrder;
   for (let oi = 0; oi < order.length; oi++) {
     const idx = order[oi];
     const cand = candidates[idx];
@@ -4371,7 +4386,12 @@ const SPLIT_STEM_ORDER = ['vocals', 'music', 'drums', 'bass', 'guitar', 'piano',
 const DISBAND_STEM_MAP = { vocals: 'vocals', instrumental: 'music', 'instrumental.drums': 'drums', 'instrumental.bass': 'bass', 'instrumental.guitar': 'guitar', 'instrumental.piano': 'piano', 'instrumental.other': 'other' };
 
 // ---- Split settings (Admin-controlled, owner order 2026-11-24) ----
-// kv_doc 'split-settings': {split6Locked, splitLimitsOn, disbandBlocked, doseedoBlocked, at}.
+// kv_doc 'split-settings': {split6Locked, splitLimitsOn, disbandBlocked, doseedoBlocked,
+// disbandKeyIdx, doseedoKeyIdx, splitLastProvider, at}. disbandKeyIdx /
+// doseedoKeyIdx = last-used 0-based key index per stem provider (-1 =
+// none yet); splitLastProvider = provider of the last fresh split
+// ('disband' | 'doseedo' | null). Rotation state for strict round-robin
+// + cross-provider alternation (owner order 2026-11-24 20:30).
 // split6Locked default true: 6-stem Studio is locked, only the 2-stem
 // Vocal Remover is usable until the owner unlocks it in Admin.
 // splitLimitsOn default true: the 2/day limit applies. The Admin
@@ -4389,9 +4409,9 @@ const DISBAND_STEM_MAP = { vocals: 'vocals', instrumental: 'music', 'instrumenta
 async function splitSettingsLoad() {
   try {
     const j = await loadKvDoc('split-settings', null);
-    if (!j || typeof j !== 'object') return { split6Locked: true, splitLimitsOn: true, disbandBlocked: false, doseedoBlocked: false };
-    return { split6Locked: j.split6Locked !== false, splitLimitsOn: j.splitLimitsOn !== false, disbandBlocked: j.disbandBlocked === true, doseedoBlocked: j.doseedoBlocked === true };
-  } catch (e) { return { split6Locked: true, splitLimitsOn: true, disbandBlocked: false, doseedoBlocked: false }; }
+    if (!j || typeof j !== 'object') return { split6Locked: true, splitLimitsOn: true, disbandBlocked: false, doseedoBlocked: false, disbandKeyIdx: -1, doseedoKeyIdx: -1, splitLastProvider: null };
+    return { split6Locked: j.split6Locked !== false, splitLimitsOn: j.splitLimitsOn !== false, disbandBlocked: j.disbandBlocked === true, doseedoBlocked: j.doseedoBlocked === true, disbandKeyIdx: (typeof j.disbandKeyIdx === 'number' ? j.disbandKeyIdx : -1), doseedoKeyIdx: (typeof j.doseedoKeyIdx === 'number' ? j.doseedoKeyIdx : -1), splitLastProvider: (j.splitLastProvider === 'disband' ? 'disband' : (j.splitLastProvider === 'doseedo' ? 'doseedo' : null)) };
+  } catch (e) { return { split6Locked: true, splitLimitsOn: true, disbandBlocked: false, doseedoBlocked: false, disbandKeyIdx: -1, doseedoKeyIdx: -1, splitLastProvider: null }; }
 }
 async function splitSettingsSave(patch) {
   const cur = await splitSettingsLoad();
@@ -4400,6 +4420,9 @@ async function splitSettingsSave(patch) {
     splitLimitsOn: patch && typeof patch.splitLimitsOn === 'boolean' ? patch.splitLimitsOn : cur.splitLimitsOn,
     disbandBlocked: patch && typeof patch.disbandBlocked === 'boolean' ? patch.disbandBlocked : cur.disbandBlocked,
     doseedoBlocked: patch && typeof patch.doseedoBlocked === 'boolean' ? patch.doseedoBlocked : cur.doseedoBlocked,
+    disbandKeyIdx: patch && typeof patch.disbandKeyIdx === 'number' ? patch.disbandKeyIdx : cur.disbandKeyIdx,
+    doseedoKeyIdx: patch && typeof patch.doseedoKeyIdx === 'number' ? patch.doseedoKeyIdx : cur.doseedoKeyIdx,
+    splitLastProvider: patch && (patch.splitLastProvider === 'disband' || patch.splitLastProvider === 'doseedo') ? patch.splitLastProvider : cur.splitLastProvider,
     at: Date.now(),
   };
   await saveKvDoc('split-settings', out, 'split-settings.json');
@@ -4844,49 +4867,128 @@ async function splitPollJob(provider, keyValue, jobId, waitS) {
   e.code = 'split_bad_provider';
   throw e;
 }
-// Router: Disband first; on ANY Disband failure (out of credits 402,
-// busy 429, error) fall back to Doseedo — EXCEPT a bad-audio error
-// (the file itself is bad; Doseedo would fail too and burn 20
-// credits) and a timeout (the Disband job is ALIVE; never start a
-// second job for the same song). Returns the provider result
-// {provider, jobId, stems, midi, keyIndex} or throws the final error.
+// ---- Strict round-robin key rotation for Disband + Doseedo (owner order 2026-11-24 20:30) ----
+// Unlike withProviderKeyRotation (sticky failover, kept for MVSEP and
+// all other providers), stem splits use STRICT round-robin: after a key
+// is used, the NEXT split uses the next key (1 -> 2 -> ... -> n -> 1),
+// never the same key twice in a row. The pointer is the last-used
+// 0-based index in the 'split-settings' kv_doc (disbandKeyIdx /
+// doseedoKeyIdx), so it survives restarts. A key that fails with a
+// rotatable (out-of-credits / rate-limit / auth) error is marked
+// exhausted in key-health and skipped; it becomes usable again
+// automatically when its quota resets (the rotation wraps back to it
+// and it is retried). A timeout means the job WAS created on that key,
+// so the pointer still advances and the error is re-thrown with
+// keyIndex for the pending registry. Non-rotatable errors fail
+// immediately without trying another key.
+async function splitRotateStemKeys(provider, fn) {
+  const p = normProvider(provider);
+  const candidates = await adminProviderKeyList(p);
+  if (!candidates.length) { const err = new Error('no key configured'); err.noKey = true; throw err; }
+  const ss = await splitSettingsLoad();
+  const lastIdx = p === 'disband' ? ss.disbandKeyIdx : ss.doseedoKeyIdx;
+  const n = candidates.length;
+  const start = (((typeof lastIdx === 'number' ? lastIdx : -1) + 1) % n + n) % n;
+  let order = [];
+  for (let i = 0; i < n; i++) order.push((start + i) % n);
+  // SKIP-BROKEN (owner order 2026-11-24 20:35, ALL providers): a key
+  // whose key-health is broken/exhausted/busy/closed from a previous
+  // failure is skipped immediately — never tried, never waited on.
+  // Only healthy ('ok') or never-tried ('unknown'/no record) keys are
+  // attempted. If EVERY key is broken, try them anyway in rotation
+  // order (a quota may have reset since it was marked; the existing
+  // wrap-around recovery depends on this). Composes with the MVSEP
+  // nearly-exhausted filter above and with the sticky start.
+  await keyHealthEnsure();
+  const _healthyOrder = order.filter((idx) => {
+    const _h = _keyHealth[p] && _keyHealth[p][String(idx)];
+    const _st = _h && typeof _h.status === 'string' ? _h.status : 'unknown';
+    return _st === 'ok' || _st === 'unknown';
+  });
+  if (_healthyOrder.length) order = _healthyOrder;
+  let lastErr = null;
+  const attempts = [];
+  for (let oi = 0; oi < order.length; oi++) {
+    const idx = order[oi];
+    const cand = candidates[idx];
+    try {
+      const out = await fn(cand.key);
+      // Strict round-robin: the next split starts at the NEXT key.
+      await splitSettingsSave(p === 'disband' ? { disbandKeyIdx: idx } : { doseedoKeyIdx: idx });
+      await keyHealthSet(p, idx, 'ok', '');
+      out.keyIndex = idx;
+      return out;
+    } catch (e) {
+      lastErr = e;
+      attempts.push({ key: idx + 1, http: (e && e.httpStatus) || 0, err: String((e && e.message) || e).slice(0, 160) });
+      if (e && e.code === 'split_timeout') {
+        await splitSettingsSave(p === 'disband' ? { disbandKeyIdx: idx } : { doseedoKeyIdx: idx });
+        e.keyIndex = idx;
+        throw e;
+      }
+      if (!_isRotatableError(e)) { lastErr.attempts = attempts; throw lastErr; }
+      await keyHealthSet(p, idx, (e && e.code === 'mvsep_queue_busy') ? 'busy' : 'exhausted', String((e && e.message) || e).slice(0, 120));
+      if (oi < order.length - 1) console.log('[keys] ' + p + ' key ' + (idx + 1) + '/' + n + ' failed (' + String((e && e.message) || e).slice(0, 120) + '), trying next key');
+    }
+  }
+  if (lastErr) lastErr.attempts = attempts;
+  throw lastErr;
+}
+
+// Router: cross-provider alternation (owner order 2026-11-24 20:30) —
+// each fresh split prefers the provider NOT used last (see
+// splitLastProvider in split-settings), falling back to the other on
+// a rotatable failure. EXCEPT a bad-audio error (the file itself is
+// bad; the other provider would fail too) and a timeout (the job is
+// ALIVE on that provider; never start a second job for the same
+// song). Within each provider, keys rotate strictly via
+// splitRotateStemKeys. Returns the provider result {provider, jobId,
+// stems, midi, keyIndex} or throws the final error.
 async function splitSeparateWithProviders(bytes, filename, isVr, maxWaitMs) {
   // Provider on/off toggles (Admin, split-settings): toggle OFF =
   // provider WORKS, toggle ON = provider BLOCKED and must not run.
   // A blocked provider is never called. Both blocked -> the handler
   // reports split_no_provider (nothing is attempted).
+  // Cross-provider alternation (owner order 2026-11-24 20:30): each
+  // FRESH split prefers the provider NOT used by the last fresh split
+  // (splitLastProvider in split-settings), then falls back to the
+  // other on a rotatable failure. A timeout or bad-audio error is
+  // never retried on the other provider (the job is alive / the file
+  // is bad). The provider that actually creates the job is recorded
+  // as last-used, so the next fresh split alternates. The first split
+  // after deploy prefers Disband (splitLastProvider unset defaults
+  // to 'doseedo'). Cached re-splits and pending resumes do NOT
+  // alternate — they resume the original provider's job.
   const _ss = await splitSettingsLoad();
   if (_ss.disbandBlocked && _ss.doseedoBlocked) {
     const _e = new Error('split_no_provider'); _e.code = 'split_no_provider'; throw _e;
   }
+  const _last = _ss.splitLastProvider === 'disband' ? 'disband' : 'doseedo';
+  const _order = _last === 'disband' ? ['doseedo', 'disband'] : ['disband', 'doseedo'];
   let _lastErr = null;
-  if (!_ss.disbandBlocked) {
-    const disbandKeys = await adminProviderKeyList('disband');
-    let usedKey = '';
+  for (const _prov of _order) {
+    if (_prov === 'disband' && _ss.disbandBlocked) continue;
+    if (_prov === 'doseedo' && _ss.doseedoBlocked) continue;
+    const _keys = await adminProviderKeyList(_prov);
+    if (!_keys.length) { const _nk = new Error('no key configured'); _nk.noKey = true; _lastErr = _nk; continue; }
     try {
-      const out = await withProviderKeyRotation('disband', async (k) => { usedKey = k; return disbandSeparate(k, bytes, filename, isVr, maxWaitMs); });
-      out.keyIndex = disbandKeys.findIndex((e) => e.key === usedKey);
+      const out = await splitRotateStemKeys(_prov, async (k) => (_prov === 'disband' ? disbandSeparate(k, bytes, filename, isVr, maxWaitMs) : doseedoSeparate(k, bytes, filename, isVr, maxWaitMs)));
+      await splitSettingsSave({ splitLastProvider: _prov });
       return out;
     } catch (e) {
-      if (e && e.code === 'split_timeout') { e.keyIndex = disbandKeys.findIndex((e2) => e2.key === usedKey); throw e; }
-      if (e && (e.code === 'disband_bad_audio' || e.httpStatus === 400)) throw e;
+      if (e && e.code === 'split_timeout') {
+        // The job is ALIVE on this provider: record it as last-used
+        // (the next fresh split alternates) and re-throw for the
+        // pending registry — never start a second job elsewhere.
+        await splitSettingsSave({ splitLastProvider: _prov });
+        throw e;
+      }
+      if (e && (e.code === 'disband_bad_audio' || e.code === 'doseedo_bad_audio' || e.httpStatus === 400)) throw e;
       _lastErr = e;
     }
   }
-  if (!_ss.doseedoBlocked) {
-    const doseedoKeys = await adminProviderKeyList('doseedo');
-    let usedKey2 = '';
-    try {
-      const out = await withProviderKeyRotation('doseedo', async (k) => { usedKey2 = k; return doseedoSeparate(k, bytes, filename, isVr, maxWaitMs); });
-      out.keyIndex = doseedoKeys.findIndex((e) => e.key === usedKey2);
-      return out;
-    } catch (e) {
-      if (e && e.code === 'split_timeout') e.keyIndex = doseedoKeys.findIndex((e2) => e2.key === usedKey2);
-      throw e;
-    }
-  }
-  // The only unblocked provider failed and the other is blocked:
-  // surface the first provider's error (e.g. noKey) so the handler
+  // The only unblocked provider failed and the other is blocked (or
+  // has no keys): surface the last error (e.g. noKey) so the handler
   // maps it the same way as before; otherwise a generic failure.
   if (_lastErr) throw _lastErr;
   const _e2 = new Error('split_failed'); _e2.code = 'split_failed'; throw _e2;
@@ -11345,6 +11447,32 @@ async function apiRoute(req, res, urlPath) {
         if (r.status === 401 || r.status === 403) return blockedMsg(r.status);
         if (r.status === 429) return { status: 'error', message: 'Rate limit (HTTP 429) — សាកល្បងម្តងទៀតពេលក្រោយ' };
         return okMsg;
+      }
+      if (p === 'disband') {
+        // GET a fake separation id: a valid key answers 404 (not
+        // found, auth passed); a bad/closed key answers 401/403; 402
+        // = out of credits. Reading a job never consumes credits.
+        const r = await fetch('https://api.disband.io/v1/separations/00000000-0000-0000-0000-000000000000', { headers: { 'Authorization': 'Bearer ' + key }, signal: AbortSignal.timeout(timeoutMs) });
+        if (r.status === 404 || r.status === 200) return okMsg;
+        if (r.status === 401 || r.status === 403) return blockedMsg(r.status);
+        if (r.status === 402) return { status: 'exhausted', message: 'អស់ credit — Disband អស់ credit ហើយ (HTTP 402)' };
+        if (r.status === 429) return { status: 'error', message: 'Rate limit (HTTP 429) — សាកល្បងម្តងទៀតពេលក្រោយ' };
+        return { status: 'error', message: 'Disband ឆ្លើយ HTTP ' + r.status };
+      }
+      if (p === 'doseedo') {
+        // GET a fake job id: a valid key answers 404 (not found, auth
+        // passed); a bad/closed key answers 401/403. 429 with
+        // insufficient_credits = out of credits.
+        const r = await fetch('https://api.doseedo.com/api/jobs/00000000-0000-0000-0000-000000000000?wait=0', { headers: { 'X-API-Key': key }, signal: AbortSignal.timeout(timeoutMs) });
+        if (r.status === 404 || r.status === 200) return okMsg;
+        if (r.status === 401 || r.status === 403) return blockedMsg(r.status);
+        if (r.status === 429) {
+          const _j = await r.json().catch(() => null);
+          const _et = _j && _j.error && typeof _j.error.type === 'string' ? _j.error.type : '';
+          if (_et === 'insufficient_credits') return { status: 'exhausted', message: 'អស់ credit — Doseedo អស់ credit ហើយ (HTTP 429)' };
+          return { status: 'error', message: 'Rate limit (HTTP 429) — សាកល្បងម្តងទៀតពេលក្រោយ' };
+        }
+        return { status: 'error', message: 'Doseedo ឆ្លើយ HTTP ' + r.status };
       }
       return { status: 'unknown', message: 'Provider នេះមិនមាន endpoint សម្រាប់សាកល្បងទេ' };
     } catch (e) {
