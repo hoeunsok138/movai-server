@@ -2414,7 +2414,7 @@ function publicSettings(s) {
 // vidfetch (VidFetch — video download API, Download Center backend
 // since 2026-11-23; key vf_live_sk_... pasted by the owner in Admin).
 const ADMIN_KEYS_FILE = path.join(DATA_DIR, 'admin-keys.json');
-const KNOWN_KEY_PROVIDERS = ['novai', 'magichour', 'masterpiecex', 'hunyuan3d', 'suno', 'acemusic', 'musicapi', 'tavus', 'groq', 'mvsep', 'agnes', 'openrouter', 'vidfetch'];
+const KNOWN_KEY_PROVIDERS = ['novai', 'magichour', 'masterpiecex', 'hunyuan3d', 'suno', 'acemusic', 'musicapi', 'tavus', 'groq', 'mvsep', 'agnes', 'openrouter', 'vidfetch', 'disband', 'doseedo'];
 function normProvider(v) {
   if (typeof v !== 'string') return '';
   let p = v.trim().toLowerCase().replace(/[\s_-]+/g, '');
@@ -4341,6 +4341,537 @@ async function withProviderKeyRotation(provider, fn, reqKey, candidatesOverride)
   }
   if (lastErr) lastErr.attempts = attempts;
   throw lastErr;
+}
+
+// ---- Disband + Doseedo stem separation (owner order 2026-11-24) ----
+// MVSEP free is dead/blocked, so NEW /api/studio/separate calls route
+// here instead: Disband first (200 free credits/day, 10 credits/min),
+// Doseedo as the fallback (120 credits/month, flat 20/song, 6 stems +
+// MIDI). MVSEP's code stays in place below for old jobs, but no new
+// split is ever sent to it. StemX / StemConsole have no usable REST
+// API and are NOT built. Doseedo has NO 2-stem mode — for Vocal
+// Remover it returns all 6 stems and the website mixer groups them
+// (vocals + the other five played together = instrumental); no
+// server-side audio mixing is attempted. The Doseedo "mix" job kind
+// exists but its price is not documented as free, so it is NOT used.
+// Result links expire (Disband 1h, Doseedo 24h): the split cache
+// stores the provider job id and a re-split re-fetches fresh URLs.
+const DISBAND_API_BASE = 'https://api.disband.io/v1';
+const DOSEEDO_API_BASE = 'https://api.doseedo.com';
+const SPLIT_POST_WAIT_MS = 30000; // POST waits at most 30s, then the client polls /status (same as MVSEP)
+const SPLIT_POLL_WAIT_S = 10; // long-poll seconds per provider status check
+const SPLIT_MAX_BYTES = 100 * 1024 * 1024; // Disband free max — the server-side size proxy for the 395 s duration limit
+const SPLIT_MAX_SECONDS = 395; // 6 min 35 s — enforced client-side before upload
+const SPLIT_DAILY_LIMIT = 2; // fresh separations per user per day (both modes combined)
+const SPLIT_CACHE_TTL_MS = 20 * 60 * 60 * 1000; // 20 h — re-fetch validates the job is still alive
+const SPLIT_PENDING_MAX_AGE_MS = 30 * 60 * 1000;
+const SPLIT_PENDING_MAX = 200;
+const SPLIT_STEM_ORDER = ['vocals', 'music', 'drums', 'bass', 'guitar', 'piano', 'other'];
+// Disband stem id -> app stem name.
+const DISBAND_STEM_MAP = { vocals: 'vocals', instrumental: 'music', 'instrumental.drums': 'drums', 'instrumental.bass': 'bass', 'instrumental.guitar': 'guitar', 'instrumental.piano': 'piano', 'instrumental.other': 'other' };
+
+// ---- Split settings (Admin-controlled, owner order 2026-11-24) ----
+// kv_doc 'split-settings': {split6Locked, splitLimitsOn, at}.
+// split6Locked default true: 6-stem Studio is locked, only the 2-stem
+// Vocal Remover is usable until the owner unlocks it in Admin.
+// splitLimitsOn default true: the 2/day limit applies. The Admin
+// switch is labelled "ប្រើឥតកំណត់" (Use Unlimited) and the owner's
+// literal semantics are: ON = normal limits apply (2/day), OFF =
+// unlimited, no limits (for owner testing). The 6-stem lock is
+// INDEPENDENT of this switch.
+async function splitSettingsLoad() {
+  try {
+    const j = await loadKvDoc('split-settings', null);
+    if (!j || typeof j !== 'object') return { split6Locked: true, splitLimitsOn: true };
+    return { split6Locked: j.split6Locked !== false, splitLimitsOn: j.splitLimitsOn !== false };
+  } catch (e) { return { split6Locked: true, splitLimitsOn: true }; }
+}
+async function splitSettingsSave(patch) {
+  const cur = await splitSettingsLoad();
+  const out = {
+    split6Locked: patch && typeof patch.split6Locked === 'boolean' ? patch.split6Locked : cur.split6Locked,
+    splitLimitsOn: patch && typeof patch.splitLimitsOn === 'boolean' ? patch.splitLimitsOn : cur.splitLimitsOn,
+    at: Date.now(),
+  };
+  await saveKvDoc('split-settings', out, 'split-settings.json');
+  return out;
+}
+function splitTodayStr() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Phnom_Penh' });
+}
+// ---- Daily split counter (per user per day, fresh separations only) ----
+// kv_doc 'split-daily': {date:'YYYY-MM-DD', counts:{email:number}}.
+// Cached re-splits and resumes never touch it (the handler checks it
+// only after the cache/pending fast paths). A split that FAILS on both
+// providers does not count (unbumped in the handler); a split that is
+// still processing (timeout) DOES count — the job is alive and will
+// finish.
+async function splitDailyLoad() {
+  try {
+    const j = await loadKvDoc('split-daily', null);
+    const today = splitTodayStr();
+    if (j && typeof j === 'object' && j.date === today && j.counts && typeof j.counts === 'object') return j;
+    return { date: today, counts: {} };
+  } catch (e) { return { date: splitTodayStr(), counts: {} }; }
+}
+async function splitDailySave(doc) {
+  try { await saveKvDoc('split-daily', doc, 'split-daily.json'); } catch (e) {}
+}
+async function splitDailyCount(email) {
+  const d = await splitDailyLoad();
+  return Number(d.counts[email] || 0);
+}
+async function splitDailyTotal() {
+  const d = await splitDailyLoad();
+  let n = 0;
+  for (const k of Object.keys(d.counts || {})) n += Number(d.counts[k] || 0);
+  return { date: d.date, total: n };
+}
+async function splitDailyBump(email) {
+  const d = await splitDailyLoad();
+  d.counts[email] = Number(d.counts[email] || 0) + 1;
+  await splitDailySave(d);
+  return d.counts[email];
+}
+async function splitDailyUnbump(email) {
+  const d = await splitDailyLoad();
+  d.counts[email] = Math.max(0, Number(d.counts[email] || 0) - 1);
+  await splitDailySave(d);
+  return d.counts[email];
+}
+// ---- Split cache + in-flight registry (new providers only) ----
+// Same pattern as the MVSEP cache/pending, but keyed by provider job
+// id (not an MVSEP hash) and stored in separate kv_docs so a new
+// split can never hit an old MVSEP entry (or vice versa).
+function splitCacheKey(audioUrl, mode) {
+  return crypto.createHash('sha256').update(String(audioUrl) + '|' + (mode || '')).digest('hex');
+}
+let _splitCache = null;
+async function splitCacheLoad() {
+  if (_splitCache && typeof _splitCache === 'object') return _splitCache;
+  const j = await loadKvDoc('split-cache', null);
+  if (j && typeof j === 'object' && j.entries && typeof j.entries === 'object') { _splitCache = j; return _splitCache; }
+  _splitCache = { entries: {} };
+  return _splitCache;
+}
+async function splitCacheSave() {
+  try { await saveKvDoc('split-cache', _splitCache, 'split-cache.json'); } catch (e) {}
+}
+async function splitCacheGet(audioUrl, mode) {
+  try {
+    const c = await splitCacheLoad();
+    const e = c.entries[splitCacheKey(audioUrl, mode)];
+    if (!e || typeof e.provider !== 'string' || !e.jobId) return null;
+    if (!e.savedAt || (Date.now() - Number(e.savedAt)) > SPLIT_CACHE_TTL_MS) return null;
+    return e;
+  } catch (err) { return null; }
+}
+async function splitCachePut(audioUrl, mode, provider, jobId, keyIndex) {
+  try {
+    if (!provider || !jobId) return;
+    const c = await splitCacheLoad();
+    c.entries[splitCacheKey(audioUrl, mode)] = { provider, jobId, keyIndex: (typeof keyIndex === 'number' ? keyIndex : -1), savedAt: Date.now() };
+    const keys = Object.keys(c.entries);
+    if (keys.length > 500) {
+      keys.sort((a, b) => (c.entries[a].savedAt || 0) - (c.entries[b].savedAt || 0));
+      for (let i = 0; i < keys.length - 500; i++) delete c.entries[keys[i]];
+    }
+    await splitCacheSave();
+  } catch (err) {}
+}
+let _splitPending = null;
+async function splitPendingLoad() {
+  if (_splitPending && typeof _splitPending === 'object') return _splitPending;
+  const j = await loadKvDoc('split-pending', null);
+  if (j && typeof j === 'object' && j.entries && typeof j.entries === 'object') { _splitPending = j; return _splitPending; }
+  _splitPending = { entries: {} };
+  return _splitPending;
+}
+async function splitPendingSave() {
+  try { await saveKvDoc('split-pending', _splitPending, 'split-pending.json'); } catch (e) {}
+}
+function splitPendingPrune(c) {
+  const now = Date.now();
+  let changed = false;
+  for (const k of Object.keys(c.entries)) {
+    const e = c.entries[k];
+    if (!e || typeof e !== 'object' || !e.createdAt || (now - Number(e.createdAt)) > SPLIT_PENDING_MAX_AGE_MS) { delete c.entries[k]; changed = true; }
+  }
+  const keys = Object.keys(c.entries);
+  if (keys.length > SPLIT_PENDING_MAX) {
+    keys.sort((a, b) => (c.entries[a].createdAt || 0) - (c.entries[b].createdAt || 0));
+    for (let i = 0; i < keys.length - SPLIT_PENDING_MAX; i++) { delete c.entries[keys[i]]; changed = true; }
+  }
+  return changed;
+}
+async function splitPendingPut(audioUrl, mode, provider, jobId, keyIndex, extra) {
+  try {
+    if (!provider || !jobId) return;
+    const c = await splitPendingLoad();
+    const ex = extra || {};
+    c.entries[splitCacheKey(audioUrl, mode)] = { provider, jobId, keyIndex: (typeof keyIndex === 'number' ? keyIndex : -1), audioUrl: String(audioUrl || ''), mode: mode || '', vr: !!ex.vr, paid6: !!ex.paid6, email: ex.email || '', createdAt: Date.now(), status: 'processing' };
+    splitPendingPrune(c);
+    await splitPendingSave();
+  } catch (e) {}
+}
+async function splitPendingGetByAudio(audioUrl, mode) {
+  try {
+    const c = await splitPendingLoad();
+    if (splitPendingPrune(c)) await splitPendingSave();
+    const e = c.entries[splitCacheKey(audioUrl, mode)];
+    if (!e || typeof e !== 'object' || e.status !== 'processing') return null;
+    return e;
+  } catch (err) { return null; }
+}
+async function splitPendingGetByJob(provider, jobId) {
+  try {
+    const c = await splitPendingLoad();
+    if (splitPendingPrune(c)) await splitPendingSave();
+    for (const k of Object.keys(c.entries)) {
+      const e = c.entries[k];
+      if (e && e.provider === provider && e.jobId === jobId && e.status === 'processing') return e;
+    }
+    return null;
+  } catch (err) { return null; }
+}
+async function splitPendingRemoveByAudio(audioUrl, mode) {
+  try {
+    const c = await splitPendingLoad();
+    delete c.entries[splitCacheKey(audioUrl, mode)];
+    await splitPendingSave();
+  } catch (e) {}
+}
+// ---- Audio bytes (both new providers need the file, not a URL) ----
+// Disband takes NO public URL — the server downloads the audio and
+// POSTs the raw bytes. Doseedo takes the bytes via its upload slot.
+// Server-side size proxy for the 395 s duration limit: Disband's free
+// max is 100 MB (the client checks the exact 395 s before uploading).
+async function fetchAudioBytes(audioUrl) {
+  let r;
+  try {
+    r = await fetch(audioUrl, { signal: AbortSignal.timeout(120000) });
+  } catch (e) {
+    const err = new Error('Could not download the song audio');
+    err.code = 'split_audio_fetch';
+    throw err;
+  }
+  if (!r.ok) {
+    const err = new Error('Could not download the song audio (HTTP ' + r.status + ')');
+    err.code = 'split_audio_fetch';
+    throw err;
+  }
+  const len = Number(r.headers && r.headers.get ? r.headers.get('content-length') : 0) || 0;
+  if (len > SPLIT_MAX_BYTES) {
+    const err = new Error('File too big — max 100 MB');
+    err.code = 'split_too_big';
+    throw err;
+  }
+  const ab = await r.arrayBuffer();
+  if (!ab || !ab.byteLength) {
+    const err = new Error('Could not download the song audio (empty file)');
+    err.code = 'split_audio_fetch';
+    throw err;
+  }
+  if (ab.byteLength > SPLIT_MAX_BYTES) {
+    const err = new Error('File too big — max 100 MB');
+    err.code = 'split_too_big';
+    throw err;
+  }
+  return Buffer.from(ab);
+}
+function splitFileName(audioUrl, songTitle) {
+  try {
+    const u = new URL(String(audioUrl));
+    const base = decodeURIComponent(u.pathname.split('/').pop() || '');
+    if (/\.(mp3|wav|flac|m4a|ogg|opus)$/i.test(base)) return base.slice(0, 120);
+  } catch (e) {}
+  const t = String(songTitle || 'song').replace(/[^\w\- ]+/g, '').trim().slice(0, 80) || 'song';
+  return t + '.mp3';
+}
+function splitSortStems(stems) {
+  const arr = Array.isArray(stems) ? stems.slice() : [];
+  arr.sort((a, b) => {
+    const ia = SPLIT_STEM_ORDER.indexOf(a.name); const ib = SPLIT_STEM_ORDER.indexOf(b.name);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  return arr;
+}
+function splitTimeoutErr(provider, jobId) {
+  const e = new Error(provider + ' separation still processing');
+  e.code = 'split_timeout';
+  e.provider = provider;
+  e.jobId = jobId;
+  return e;
+}
+// One retry for a transient provider status read (network blip): a
+// failed read must not kill a live job or trigger a fallback split.
+async function splitPollGet(fn) {
+  try { return await fn(); }
+  catch (e) {
+    if (e && (e.code === 'disband_not_found' || e.code === 'doseedo_not_found')) throw e;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    return await fn();
+  }
+}
+// ---- Disband ----
+// POST /separations (raw body) -> 202 {id, status}; poll
+// GET /separations/{id} (Prefer: wait=N) until ready/failed.
+// Errors are RFC 9457 problem+json. 402 = out of credits, 429 = busy.
+// Verified against https://api.disband.io/v1/openapi.json 2026-11-24.
+function disbandErrText(j) {
+  if (!j || typeof j !== 'object') return '';
+  return (typeof j.detail === 'string' && j.detail) || (typeof j.title === 'string' && j.title) || (typeof j.type === 'string' && j.type) || '';
+}
+function disbandHttpErr(status, j) {
+  const detail = disbandErrText(j);
+  let code = 'disband_error', label = 'HTTP ' + status;
+  if (status === 402) { code = 'disband_out_of_credits'; label = 'out of credits'; }
+  else if (status === 429) { code = 'disband_busy'; label = 'busy — too many requests'; }
+  else if (status === 400) { code = 'disband_bad_audio'; label = 'bad audio'; }
+  else if (status === 404) { code = 'disband_not_found'; label = 'not found'; }
+  const e = new Error('Disband: ' + label + (detail ? ' — ' + detail : ''));
+  e.httpStatus = status; e.code = code;
+  return e;
+}
+function disbandMapStems(job) {
+  const stems = [];
+  const m = (job && job.stems && typeof job.stems === 'object') ? job.stems : {};
+  for (const k of Object.keys(m)) {
+    const name = DISBAND_STEM_MAP[k];
+    if (!name) continue;
+    const v = m[k];
+    if (!v || typeof v !== 'object' || v.silent === true) continue;
+    const url = (v.mp3 && typeof v.mp3.url === 'string' && v.mp3.url) || (v.wav && typeof v.wav.url === 'string' && v.wav.url) || '';
+    if (url) stems.push({ name, url });
+  }
+  return splitSortStems(stems);
+}
+async function disbandGetJob(keyValue, jobId, waitS) {
+  const r = await fetch(DISBAND_API_BASE + '/separations/' + encodeURIComponent(jobId), { headers: { 'Authorization': 'Bearer ' + keyValue, 'Prefer': 'wait=' + Math.max(0, Math.min(60, waitS || 0)) }, signal: AbortSignal.timeout(90000) });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw disbandHttpErr(r.status, j);
+  return j;
+}
+async function disbandSeparate(keyValue, bytes, filename, isVr, maxWaitMs) {
+  const waitMs = (typeof maxWaitMs === 'number' && maxWaitMs > 0) ? maxWaitMs : SPLIT_POST_WAIT_MS;
+  const stemParams = isVr
+    ? ['vocals', 'instrumental']
+    : ['vocals', 'instrumental.drums', 'instrumental.bass', 'instrumental.guitar', 'instrumental.piano', 'instrumental.other'];
+  const qs = stemParams.map((s) => 'stems=' + encodeURIComponent(s)).join('&') + '&formats=mp3&name=' + encodeURIComponent(String(filename || 'song.mp3').slice(0, 255));
+  const r = await fetch(DISBAND_API_BASE + '/separations?' + qs, { method: 'POST', headers: { 'Authorization': 'Bearer ' + keyValue, 'Content-Type': 'application/octet-stream' }, body: bytes, signal: AbortSignal.timeout(60000) });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw disbandHttpErr(r.status, j);
+  const jobId = j && typeof j.id === 'string' ? j.id : '';
+  if (!jobId) { const e = new Error('Disband: no separation id returned'); e.code = 'disband_error'; throw e; }
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    let job;
+    try { job = await splitPollGet(() => disbandGetJob(keyValue, jobId, SPLIT_POLL_WAIT_S)); }
+    catch (e) { if (e) { e.jobId = jobId; e.provider = 'disband'; } throw e; }
+    if (job && job.status === 'ready') {
+      const stems = disbandMapStems(job);
+      if (!stems.length) { const e = new Error('Disband: separation finished with no stems'); e.code = 'disband_error'; e.jobId = jobId; throw e; }
+      return { provider: 'disband', jobId, stems, midi: null, duration: (typeof job.duration === 'number' ? job.duration : null) };
+    }
+    if (job && job.status === 'failed') {
+      const e = new Error('Disband: separation failed' + (job.error && job.error.message ? ': ' + String(job.error.message).slice(0, 160) : ''));
+      e.code = 'disband_failed';
+      e.jobId = jobId;
+      throw e;
+    }
+    if (Date.now() >= deadline) throw splitTimeoutErr('disband', jobId);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+// ---- Doseedo ----
+// Upload slot (POST /api/jobs/uploads -> PUT bytes) then
+// POST /api/jobs {kind:'separate_stems'}; poll GET /api/jobs/{id}?wait=N
+// until succeeded/failed. 429 insufficient_credits = out of credits
+// (not retryable); 429 rate_limited = busy (retryable). The "mix" job
+// kind exists but its price is not documented as free, so the 2-stem
+// Vocal Remover gets all 6 stems and the website mixer groups them
+// (vocals + the other five together = instrumental) — no mixing here.
+// Verified against https://api.doseedo.com/api/jobs/openapi.json 2026-11-24.
+function doseedoErrText(j) {
+  if (!j || typeof j !== 'object') return '';
+  const e = j.error && typeof j.error === 'object' ? j.error : null;
+  if (e && typeof e.message === 'string' && e.message) return e.message;
+  if (typeof j.message === 'string' && j.message) return j.message;
+  return '';
+}
+function doseedoHttpErr(status, j) {
+  const detail = doseedoErrText(j);
+  const et = j && j.error && typeof j.error.type === 'string' ? j.error.type : '';
+  let code = 'doseedo_error', label = 'HTTP ' + status;
+  if (status === 402 || et === 'insufficient_credits') { code = 'doseedo_out_of_credits'; label = 'out of credits'; }
+  else if (status === 429) { code = 'doseedo_busy'; label = 'busy — too many requests'; }
+  else if (status === 400) { code = 'doseedo_bad_audio'; label = 'bad audio'; }
+  else if (status === 404) { code = 'doseedo_not_found'; label = 'not found'; }
+  const e = new Error('Doseedo: ' + label + (detail ? ' — ' + detail : ''));
+  e.httpStatus = status; e.code = code;
+  return e;
+}
+function doseedoMapStems(job) {
+  const stems = [];
+  const seen = {};
+  const addStem = (name, url) => {
+    if (!name || !url || seen[name]) return;
+    seen[name] = true;
+    stems.push({ name, url });
+  };
+  const out = (job && job.output && typeof job.output === 'object') ? job.output : {};
+  const sm = out.stems && typeof out.stems === 'object' ? out.stems : {};
+  for (const k of Object.keys(sm)) {
+    const v = sm[k];
+    const url = typeof v === 'string' ? v : (v && typeof v.url === 'string' ? v.url : '');
+    if (url) addStem(String(k).toLowerCase(), url);
+  }
+  const arts = Array.isArray(job && job.artifacts) ? job.artifacts : [];
+  for (const a of arts) {
+    if (a && a.type === 'audio' && typeof a.name === 'string' && typeof a.url === 'string') addStem(a.name.toLowerCase(), a.url);
+  }
+  return splitSortStems(stems);
+}
+function doseedoMapMidi(job) {
+  const midi = {};
+  const out = (job && job.output && typeof job.output === 'object') ? job.output : {};
+  const mm = out.midi && typeof out.midi === 'object' ? out.midi : {};
+  for (const k of Object.keys(mm)) {
+    const v = mm[k];
+    const url = typeof v === 'string' ? v : (v && typeof v.url === 'string' ? v.url : '');
+    if (url) midi[String(k).toLowerCase()] = url;
+  }
+  const arts = Array.isArray(job && job.artifacts) ? job.artifacts : [];
+  for (const a of arts) {
+    if (a && a.type === 'midi' && typeof a.name === 'string' && typeof a.url === 'string') {
+      const n = a.name.toLowerCase().replace(/\.mid$/i, '');
+      if (!midi[n]) midi[n] = a.url;
+    }
+  }
+  return Object.keys(midi).length ? midi : null;
+}
+async function doseedoGetJob(keyValue, jobId, waitS) {
+  const r = await fetch(DOSEEDO_API_BASE + '/api/jobs/' + encodeURIComponent(jobId) + '?wait=' + Math.max(0, Math.min(50, waitS || 0)), { headers: { 'X-API-Key': keyValue }, signal: AbortSignal.timeout(90000) });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw doseedoHttpErr(r.status, j);
+  return j;
+}
+async function doseedoSeparate(keyValue, bytes, filename, isVr, maxWaitMs) {
+  const waitMs = (typeof maxWaitMs === 'number' && maxWaitMs > 0) ? maxWaitMs : SPLIT_POST_WAIT_MS;
+  const fname = String(filename || 'song.mp3');
+  const ctype = /\.wav$/i.test(fname) ? 'audio/wav' : /\.flac$/i.test(fname) ? 'audio/flac' : /\.m4a$/i.test(fname) ? 'audio/mp4' : /\.ogg$/i.test(fname) ? 'audio/ogg' : 'audio/mpeg';
+  // 1) Reserve an upload slot.
+  const up = await fetch(DOSEEDO_API_BASE + '/api/jobs/uploads', { method: 'POST', headers: { 'X-API-Key': keyValue, 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: fname, type: 'audio', content_type: ctype }), signal: AbortSignal.timeout(30000) });
+  const upJ = await up.json().catch(() => null);
+  if (!up.ok) throw doseedoHttpErr(up.status, upJ);
+  const uploadUrl = upJ && typeof upJ.upload_url === 'string' ? upJ.upload_url : '';
+  const audioKey = upJ && typeof upJ.key === 'string' ? upJ.key : '';
+  const inputParam = upJ && typeof upJ.input_param === 'string' && upJ.input_param ? upJ.input_param : 'audio_key';
+  if (!uploadUrl || !audioKey) { const e = new Error('Doseedo: no upload slot returned'); e.code = 'doseedo_error'; throw e; }
+  // 2) PUT the audio bytes to the presigned URL.
+  const upHeaders = Object.assign({}, (upJ.headers && typeof upJ.headers === 'object' ? upJ.headers : {}));
+  if (!upHeaders['Content-Type'] && !upHeaders['content-type']) upHeaders['Content-Type'] = ctype;
+  const put = await fetch(uploadUrl, { method: (upJ.method && typeof upJ.method === 'string' ? upJ.method : 'PUT'), headers: upHeaders, body: bytes, signal: AbortSignal.timeout(120000) });
+  if (!put.ok) { const e = new Error('Doseedo: audio upload failed (HTTP ' + put.status + ')'); e.code = 'doseedo_error'; e.httpStatus = put.status; throw e; }
+  // 3) Create the separate_stems job. 6-stem always (no 2-stem mode):
+  // for Vocal Remover the 6 stems come back and the website groups
+  // them; include_midi only matters for the 6-stem Studio.
+  const input = {};
+  input[inputParam] = audioKey;
+  input.models = '6stem';
+  if (isVr) { input.stems_only = true; }
+  else { input.include_midi = true; }
+  const cr = await fetch(DOSEEDO_API_BASE + '/api/jobs', { method: 'POST', headers: { 'X-API-Key': keyValue, 'Content-Type': 'application/json' }, body: JSON.stringify({ kind: 'separate_stems', input }), signal: AbortSignal.timeout(30000) });
+  const cj = await cr.json().catch(() => null);
+  if (!cr.ok) throw doseedoHttpErr(cr.status, cj);
+  const jobId = cj && typeof cj.id === 'string' ? cj.id : '';
+  if (!jobId) { const e = new Error('Doseedo: no job id returned'); e.code = 'doseedo_error'; throw e; }
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    let job;
+    try { job = await splitPollGet(() => doseedoGetJob(keyValue, jobId, SPLIT_POLL_WAIT_S)); }
+    catch (e) { if (e) { e.jobId = jobId; e.provider = 'doseedo'; } throw e; }
+    if (job && job.status === 'succeeded') {
+      const stems = doseedoMapStems(job);
+      if (!stems.length) { const e = new Error('Doseedo: separation finished with no stems'); e.code = 'doseedo_error'; e.jobId = jobId; throw e; }
+      return { provider: 'doseedo', jobId, stems, midi: doseedoMapMidi(job) };
+    }
+    if (job && (job.status === 'failed' || job.status === 'canceled')) {
+      const e = new Error('Doseedo: separation ' + job.status + (job.error && job.error.message ? ': ' + String(job.error.message).slice(0, 160) : ''));
+      e.code = 'doseedo_failed';
+      e.jobId = jobId;
+      throw e;
+    }
+    if (Date.now() >= deadline) throw splitTimeoutErr('doseedo', jobId);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+// Poll one new-provider job once (status endpoint): waitS 0 = immediate
+// state (the client polls every 10s), waitS > 0 = long-poll.
+// Returns {done, stems, midi} or {done:false}; throws on failure /
+// not-found so the caller can try the next key or report it.
+async function splitPollJob(provider, keyValue, jobId, waitS) {
+  if (provider === 'disband') {
+    const job = await disbandGetJob(keyValue, jobId, waitS);
+    if (job && job.status === 'ready') return { done: true, stems: disbandMapStems(job), midi: null };
+    if (job && job.status === 'failed') {
+      const e = new Error('Disband: separation failed');
+      e.code = 'disband_failed';
+      throw e;
+    }
+    return { done: false };
+  }
+  if (provider === 'doseedo') {
+    const job = await doseedoGetJob(keyValue, jobId, waitS);
+    if (job && job.status === 'succeeded') return { done: true, stems: doseedoMapStems(job), midi: doseedoMapMidi(job) };
+    if (job && (job.status === 'failed' || job.status === 'canceled')) {
+      const e = new Error('Doseedo: separation ' + job.status);
+      e.code = 'doseedo_failed';
+      throw e;
+    }
+    return { done: false };
+  }
+  const e = new Error('Unknown split provider');
+  e.code = 'split_bad_provider';
+  throw e;
+}
+// Router: Disband first; on ANY Disband failure (out of credits 402,
+// busy 429, error) fall back to Doseedo — EXCEPT a bad-audio error
+// (the file itself is bad; Doseedo would fail too and burn 20
+// credits) and a timeout (the Disband job is ALIVE; never start a
+// second job for the same song). Returns the provider result
+// {provider, jobId, stems, midi, keyIndex} or throws the final error.
+async function splitSeparateWithProviders(bytes, filename, isVr, maxWaitMs) {
+  const disbandKeys = await adminProviderKeyList('disband');
+  let usedKey = '';
+  try {
+    const out = await withProviderKeyRotation('disband', async (k) => { usedKey = k; return disbandSeparate(k, bytes, filename, isVr, maxWaitMs); });
+    out.keyIndex = disbandKeys.findIndex((e) => e.key === usedKey);
+    return out;
+  } catch (e) {
+    if (e && e.code === 'split_timeout') { e.keyIndex = disbandKeys.findIndex((e2) => e2.key === usedKey); throw e; }
+    if (e && (e.code === 'disband_bad_audio' || e.httpStatus === 400)) throw e;
+  }
+  const doseedoKeys = await adminProviderKeyList('doseedo');
+  let usedKey2 = '';
+  try {
+    const out = await withProviderKeyRotation('doseedo', async (k) => { usedKey2 = k; return doseedoSeparate(k, bytes, filename, isVr, maxWaitMs); });
+    out.keyIndex = doseedoKeys.findIndex((e) => e.key === usedKey2);
+    return out;
+  } catch (e) {
+    if (e && e.code === 'split_timeout') e.keyIndex = doseedoKeys.findIndex((e2) => e2.key === usedKey2);
+    throw e;
+  }
+}
+// Shape new-provider stems for the Vocal Remover response. Disband VR
+// is a true 2-stem split, so it goes through the Admin VR locks like
+// before (vocals + music + locked rows). Doseedo VR returns all 6
+// stems (its separate_stems job is always 6 stems for a flat 20
+// credits — the locks cannot change that), so the website mixer
+// groups them: vocals + the other five together = instrumental.
+function splitVrRows(provider, stems, locks) {
+  if (provider === 'doseedo') return Array.isArray(stems) ? stems.slice() : [];
+  return vrRowsFromStems(stems, locks);
 }
 
 // ---- Auto Update Version New (top-level helpers) ----
@@ -8728,18 +9259,22 @@ async function apiRoute(req, res, urlPath) {
   // it calls cloudinaryStoreSong — helpers defined after this point
   // would be in TDZ from here (apiRoute returns at the first match).
   // POST /api/studio/separate — {email, audioUrl, songTitle?, stems?} — requires logged-in email.
-  // MVSEP stem separation for MOVAI STUDIO and the Vocal Remover:
-  // creates a separation for the song's audio URL, polls MVSEP until it
-  // finishes, and returns {ok, stems:[{name,url}], hash}. stems: 2 =
-  // Vocal Remover (Admin locks pick the model: 2/4/6 stems, 2 free
-  // then 6 song credits); anything else = 6-stem Studio (old
-  // package/free/bonus allowance). Keys rotate on
-  // daily-limit errors (50/day/key); if every key is exhausted returns
-  // error 'mvsep_limit'. If the job is still processing after the
-  // server-side poll timeout, returns error 'mvsep_timeout' WITH the hash
-  // so the Studio can resume via GET /api/studio/separate/status without
-  // creating (and paying quota for) a second separation. The server never
-  // stores stem files — it returns MVSEP's download URLs.
+  // Stem separation for MOVAI STUDIO and the Vocal Remover, routed to
+  // Disband first and Doseedo as the fallback (owner order 2026-11-24;
+  // MVSEP free is dead/blocked — no new split is ever sent to MVSEP).
+  // Creates a separation for the song's audio URL, polls the provider
+  // until it finishes, and returns {ok, stems:[{name,url}], midi?,
+  // provider, jobId}. stems: 2 = Vocal Remover (2 free then 6 song
+  // credits); anything else = 6-stem Studio (old package/free/bonus
+  // allowance). 6-stem is LOCKED by default in Admin (split6Locked);
+  // each user gets 2 fresh separations per day (split-daily), bypassed
+  // when the Admin "ប្រើឥតកំណត់" switch is OFF. If the job is still
+  // processing after the server-side poll timeout, returns error
+  // 'split_timeout' WITH provider + jobId so the Studio can resume via
+  // GET /api/studio/separate/status without creating (and paying quota
+  // for) a second separation. The server never stores stem files — it
+  // returns the provider's download URLs (Disband links expire in 1h,
+  // Doseedo in 24h; the split cache re-fetches fresh URLs).
   if (req.method === 'POST' && urlPath === '/api/studio/separate') {
     readJSONBody(req, 64 * 1024).then(async (body) => {
       try {
@@ -8752,10 +9287,10 @@ async function apiRoute(req, res, urlPath) {
         // Anything else (including no stems field) keeps the 6-stem Studio.
         const vr = body && (body.stems === 2 || body.stems === '2');
         const _locks = vr ? await vrLocksLoad() : null;
-        const _model = vr ? vrModelFor(_locks) : null;
-        // Cache-mode: 'vr2'/'vr4' for Vocal Remover jobs; '' shares the
-        // Studio cache for VR 6-stem jobs (same model, same audio).
-        const _vrMode = vr ? ((_model.mode === '2') ? 'vr2' : (_model.mode === '4') ? 'vr4' : '') : '';
+        // Split mode for the new-provider cache/pending: 'vr' = Vocal
+        // Remover (2-stem), '' = 6-stem Studio. MVSEP's model/mode
+        // (_model/_vrMode) is gone — new splits never go to MVSEP.
+        const _mode = vr ? 'vr' : '';
         // Account check first (unknown email -> no_account). The
         // allowance itself is consumed only for a FRESH separation
         // below — a cached re-split or a resume of a running job
@@ -8764,31 +9299,48 @@ async function apiRoute(req, res, urlPath) {
         const _vsUsers = await loadUsers();
         const _vsU = _vsUsers[email];
         if (!_vsU) return sendJSON(res, 200, { ok: false, error: 'no_account' });
-        // Fast path: this song was separated before — ask MVSEP for the
-        // OLD job's fresh stem URLs instead of creating (and paying quota
-        // for) a new separation. Re-splits return in ~1-2s. If the old
-        // job is still processing, hand its hash back so the Studio
-        // resumes via the status endpoint (no second job, no extra quota).
-        // Any failure falls through to a fresh separation below.
-        const cachedHash = await mvsepCacheGet(audioUrl, _vrMode);
-        if (cachedHash) {
+        // 6-stem lock (Admin-controlled, default locked): a locked
+        // 6-stem split is refused outright — even a cached re-split —
+        // before anything is charged or counted. The 2-stem Vocal
+        // Remover is always available.
+        const _splitSettings = await splitSettingsLoad();
+        if (!vr && _splitSettings.split6Locked) return sendJSON(res, 200, { ok: false, error: '6 ស្ទេមត្រូវបានចាក់សោដោយ Admin — សូមប្រើ 2 សំឡេងសិន · 6-stem splitting is locked by the Admin — please use 2 sounds for now', code: 'split6_locked' });
+        // Fast path: this song was separated before with Disband or
+        // Doseedo — ask that provider for the OLD job's fresh stem URLs
+        // instead of creating (and paying quota for) a new separation.
+        // Re-splits return in ~1-2s. If the old job is still
+        // processing, hand its provider + job id back so the Studio
+        // resumes via the status endpoint (no second job, no extra
+        // quota). Any failure falls through to a fresh separation below.
+        const _cachedJob = await splitCacheGet(audioUrl, _mode);
+        if (_cachedJob) {
           try {
-            const r = await mvsepGetSeparation(cachedHash);
-            if (r.done && r.stems && r.stems.length) {
-              return sendJSON(res, 200, { ok: true, provider: 'mvsep', hash: cachedHash, songTitle, stems: vr ? vrRowsFromStems(r.stems, _locks) : r.stems, cached: true });
+            const _keys = await adminProviderKeyList(_cachedJob.provider);
+            const _ordered = _cachedJob.keyIndex >= 0 && _keys[_cachedJob.keyIndex] ? [_keys[_cachedJob.keyIndex]].concat(_keys.filter((_, i) => i !== _cachedJob.keyIndex)) : _keys;
+            let _r = null;
+            for (const _cand of _ordered) {
+              try { _r = await splitPollJob(_cachedJob.provider, _cand.key, _cachedJob.jobId, 0); break; }
+              catch (e) { if (e && (e.code === 'disband_not_found' || e.code === 'doseedo_not_found')) continue; throw e; }
             }
-            return sendJSON(res, 200, { ok: false, error: 'mvsep_timeout', hash: cachedHash, message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
+            if (_r && _r.done && _r.stems && _r.stems.length) {
+              return sendJSON(res, 200, { ok: true, provider: _cachedJob.provider, jobId: _cachedJob.jobId, songTitle, stems: vr ? splitVrRows(_cachedJob.provider, _r.stems, _locks) : _r.stems, midi: _r.midi || null, cached: true });
+            }
+            return sendJSON(res, 200, { ok: false, error: 'split_timeout', code: 'split_timeout', provider: _cachedJob.provider, jobId: _cachedJob.jobId, message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
           } catch (e) { /* old job gone/failed — fall through to a fresh separation */ }
         }
         // In-flight dedup: this song already has a separation running
         // (created by an earlier tap that timed out on our side).
-        // Resume THAT hash instead of creating a duplicate job on
-        // another key — a duplicate is what fanned one stuck song
-        // across all 11 MVSEP queues (2026-11-19).
-        const pendingHash = await mvsepPendingGetByAudio(audioUrl, _vrMode);
-        if (pendingHash) {
-          return sendJSON(res, 200, { ok: false, error: 'mvsep_timeout', hash: pendingHash, message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
+        // Resume THAT job instead of creating a duplicate.
+        const _pendingJob = await splitPendingGetByAudio(audioUrl, _mode);
+        if (_pendingJob) {
+          return sendJSON(res, 200, { ok: false, error: 'split_timeout', code: 'split_timeout', provider: _pendingJob.provider, jobId: _pendingJob.jobId, message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
         }
+        // Daily limit: 2 fresh separations per user per day (both modes
+        // combined). Checked AFTER the cache/pending fast paths (cached
+        // re-splits and resumes cost nothing) and BEFORE consuming
+        // allowance/credits. The Admin "ប្រើឥតកំណត់" switch OFF
+        // (splitLimitsOn false) skips this check entirely.
+        if (_splitSettings.splitLimitsOn && (await splitDailyCount(email)) >= SPLIT_DAILY_LIMIT) return sendJSON(res, 200, { ok: false, error: 'ថ្ងៃនេះអ្នកបានបំបែក 2 ដងហើយ — សូមរង់ចាំថ្ងៃស្អែក · You have used your 2 splits for today — please come back tomorrow', code: 'split_daily_limit' });
         // "Free 2 + package allowance" — consumed only now, for a
         // fresh separation. Package allowance first, then the 2 free
         // uses, then bonus. A fresh separation that later fails or
@@ -8815,33 +9367,45 @@ async function apiRoute(req, res, urlPath) {
         _vsU.updatedAt = new Date().toISOString();
         await saveUsers(_vsUsers);
         scheduleBackup('users.json');
+        // Fresh separation: count it against the user's 2/day split
+        // limit (cached re-splits and resumes above never reach here).
+        await splitDailyBump(email);
         let out;
         try {
-          out = await withProviderKeyRotation('mvsep', async (k) => {
-            // 30s max in the POST: after that the client polls /status
-            // with a live check count, so a long split never looks stuck.
-            const r = await mvsepSeparateWithKey(k, audioUrl, 30000, vr ? _model : null, { paid6: paid6, email: email });
-            return { hash: r.hash, stems: r.stems, keyUsed: k };
-          });
+          // 30s max in the POST: after that the client polls /status
+          // with a live check count, so a long split never looks stuck.
+          // The audio bytes are fetched once here (Disband needs the
+          // raw bytes; Doseedo uploads them too). The 100 MB cap is
+          // the server-side proxy for the 395 s duration limit.
+          const _audioBytes = await fetchAudioBytes(audioUrl);
+          out = await splitSeparateWithProviders(_audioBytes, splitFileName(audioUrl, songTitle), vr, SPLIT_POST_WAIT_MS);
         } catch (e) {
-          if (e && e.code === 'mvsep_timeout') return sendJSON(res, 200, Object.assign({ ok: false, error: 'mvsep_timeout', hash: e.hash || '', message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } }, vr ? { charged: paid6 ? VR_COST : 0, freeLeft: Math.max(0, FEATURE_FREE_LIMIT - featureFreeUsed(_vsU, 'freeVsUsed')) } : {}));
-          // A paid Vocal Remover job died (no key, create failed, or
-          // MVSEP failed it during the 30s wait) — refund the 6 credits
-          // once and un-pend the dead hash so a re-tap can start fresh.
-          // A timeout means the job is ALIVE on MVSEP (handled above) —
-          // no refund for that.
-          if (paid6) { try { await refundForGeneration(email, 0, VR_COST, 'song:vocal-remover failed'); if (e && e.hash) await mvsepPendingRemove(e.hash); } catch (e2) {} }
-          if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'mvsep_no_key', message: { km: 'Admin មិនទាន់ដាក់ API Key សម្រាប់បំបែកបទទេ', en: 'Admin has not added an API key for splitting yet' } });
-          if (e && e.code === 'mvsep_queue_busy') return sendJSON(res, 200, { ok: false, error: 'mvsep_busy', message: { km: 'MovAi កំពុងបំបែកបទមុន — សូមរង់ចាំបន្តិច (ប៉ុន្មាននាទី) ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still processing a previous split — please wait a few minutes and try Split (AI) again' }, debugAttempts: (e && e.attempts) || undefined });
-          if (e && /quota exceeded/i.test(String(e.message || ''))) return sendJSON(res, 200, { ok: false, error: 'mvsep_limit', message: { km: 'MovAi ដល់កំណត់ 50 បទ/ថ្ងៃ លើ Key ទាំងអស់ហើយ — សូមសាកល្បងម្តងទៀតនៅថ្ងៃស្អែក', en: 'MovAi daily limit of 50 songs/day reached on all keys — please try again tomorrow' }, debugAttempts: (e && e.attempts) || undefined });
-          return sendJSON(res, 200, { ok: false, error: String((e && e.message) || 'MovAi: request failed').replace(/^MVSEP:\s*/, 'MovAi: ') });
+          // Still processing (the job is ALIVE on Disband/Doseedo):
+          // record it so a re-tap resumes THIS job instead of
+          // creating a duplicate — and keep the daily count (the
+          // split will finish). No refund for a timeout.
+          if (e && e.code === 'split_timeout') {
+            await splitPendingPut(audioUrl, _mode, e.provider || '', e.jobId || '', (typeof e.keyIndex === 'number' ? e.keyIndex : -1), { vr, paid6, email });
+            return sendJSON(res, 200, Object.assign({ ok: false, error: 'split_timeout', code: 'split_timeout', provider: e.provider || '', jobId: e.jobId || '', message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } }, vr ? { charged: paid6 ? VR_COST : 0, freeLeft: Math.max(0, FEATURE_FREE_LIMIT - featureFreeUsed(_vsU, 'freeVsUsed')) } : {}));
+          }
+          // The split FAILED on both providers: it does not count
+          // against the 2/day limit, so un-bump it. A paid Vocal
+          // Remover job also gets its 6 credits refunded once (the
+          // existing rule — free/package allowance is not refunded).
+          try { await splitDailyUnbump(email); } catch (e2) {}
+          if (paid6) { try { await refundForGeneration(email, 0, VR_COST, 'song:vocal-remover failed'); } catch (e2) {} }
+          if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'split_no_key', code: 'split_no_key', message: { km: 'Admin មិនទាន់ដាក់ API Key សម្រាប់បំបែកបទទេ', en: 'Admin has not added an API key for splitting yet' } });
+          if (e && e.code === 'split_too_big') return sendJSON(res, 200, { ok: false, error: 'ឯកសារធំពេក — អតិបរមា 100 MB · File too big — max 100 MB', code: 'split_too_big' });
+          if (e && (e.code === 'disband_bad_audio' || e.code === 'doseedo_bad_audio')) return sendJSON(res, 200, { ok: false, error: 'ឯកសារសំឡេងនេះបំបែកមិនបានទេ · This audio file could not be split', code: 'split_bad_audio' });
+          if (e && (e.code === 'disband_out_of_credits' || e.code === 'doseedo_out_of_credits')) return sendJSON(res, 200, { ok: false, error: 'Disband និង Doseedo អស់ក្រេឌីតហើយ — សូមសាកល្បងម្តងទៀតនៅថ្ងៃស្អែក · Disband and Doseedo are both out of credits — please try again tomorrow', code: 'split_no_credits', debugAttempts: (e && e.attempts) || undefined });
+          return sendJSON(res, 200, { ok: false, error: 'បំបែកមិនបានទេ — Disband និង Doseedo ទាំងពីរមិនអាចប្រើបាន · Both split providers are unavailable right now, please try again later', code: 'split_failed', debugAttempts: (e && e.attempts) || undefined });
         }
-        // Success: count it against the key that did the work (server-side daily counter for the Admin display).
-        await recordMvsepSeparation(out.keyUsed, out.hash);
-        await mvsepPendingRemove(out.hash);
-        // Remember this song's separation so a later re-split returns in ~1-2s from the cache instead of ~2 min.
-        await mvsepCachePut(audioUrl, out.hash, _vrMode);
-        return sendJSON(res, 200, Object.assign({ ok: true, provider: 'mvsep', hash: out.hash, songTitle, stems: vr ? vrRowsFromStems(out.stems, _locks) : out.stems }, vr ? { charged: paid6 ? VR_COST : 0, freeLeft: Math.max(0, FEATURE_FREE_LIMIT - featureFreeUsed(_vsU, 'freeVsUsed')) } : {}));
+        // Success: remember this song's separation so a later re-split
+        // returns in ~1-2s from the cache instead of ~2 min (the
+        // provider job id is re-fetched for fresh download URLs).
+        await splitPendingRemoveByAudio(audioUrl, _mode);
+        await splitCachePut(audioUrl, _mode, out.provider, out.jobId, out.keyIndex);
+        return sendJSON(res, 200, Object.assign({ ok: true, provider: out.provider, jobId: out.jobId, songTitle, stems: vr ? splitVrRows(out.provider, out.stems, _locks) : out.stems, midi: out.midi || null }, vr ? { charged: paid6 ? VR_COST : 0, freeLeft: Math.max(0, FEATURE_FREE_LIMIT - featureFreeUsed(_vsU, 'freeVsUsed')) } : {}));
       } catch (e) { return sendJSON(res, 200, { ok: false, error: 'MovAi: ' + (e && e.message ? String(e.message).replace(/^MVSEP:\s*/, '').slice(0, 200) : 'request failed') }); }
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
@@ -8884,6 +9448,39 @@ async function apiRoute(req, res, urlPath) {
         const qp = new URL(req.url, 'http://localhost').searchParams;
         const email = normEmail(qp.get('email') || '');
         if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
+        // New providers (Disband / Doseedo): ?provider=disband|doseedo&jobId=
+        // — polls that provider's job (the key that created it is tried
+        // first, then the other keys). The legacy ?hash= MVSEP path
+        // below is untouched.
+        const _sp = String(qp.get('provider') || '').trim().toLowerCase();
+        const _sj = String(qp.get('jobId') || '').trim().slice(0, 200);
+        if (_sp && _sj) {
+          if (_sp !== 'disband' && _sp !== 'doseedo') return sendJSON(res, 200, { ok: false, error: 'split_bad_provider', provider: _sp, jobId: _sj });
+          const _skeys = await adminProviderKeyList(_sp);
+          if (!_skeys.length) return sendJSON(res, 200, { ok: false, error: 'split_no_key', provider: _sp, jobId: _sj, message: { km: 'Admin មិនទាន់ដាក់ API Key សម្រាប់បំបែកបទទេ', en: 'Admin has not added an API key for splitting yet' } });
+          const _spend = await splitPendingGetByJob(_sp, _sj);
+          const _sk = _spend && typeof _spend.keyIndex === 'number' ? _spend.keyIndex : -1;
+          const _sordered = (_sk >= 0 && _skeys[_sk]) ? [_skeys[_sk]].concat(_skeys.filter((_, i) => i !== _sk)) : _skeys;
+          for (const _cand of _sordered) {
+            let _sr;
+            try { _sr = await splitPollJob(_sp, _cand.key, _sj, 0); }
+            catch (e2) {
+              if (e2 && (e2.code === 'disband_not_found' || e2.code === 'doseedo_not_found')) continue;
+              return sendJSON(res, 200, { ok: false, error: 'split_failed', provider: _sp, jobId: _sj, message: { km: 'បំបែកមិនបានទេ · Split failed', en: 'Split failed' } });
+            }
+            if (_sr && _sr.done && _sr.stems && _sr.stems.length) {
+              if (_spend && _spend.audioUrl) {
+                await splitCachePut(_spend.audioUrl, _spend.mode || '', _sp, _sj, _sk);
+                await splitPendingRemoveByAudio(_spend.audioUrl, _spend.mode || '');
+              }
+              const _svr = !!(_spend && _spend.vr);
+              const _slocks = _svr ? await vrLocksLoad() : null;
+              return sendJSON(res, 200, { ok: true, done: true, provider: _sp, jobId: _sj, stems: _svr ? splitVrRows(_sp, _sr.stems, _slocks) : _sr.stems, midi: _sr.midi || null });
+            }
+            return sendJSON(res, 200, { ok: true, done: false, status: 'processing', provider: _sp, jobId: _sj });
+          }
+          return sendJSON(res, 200, { ok: false, error: 'split_not_found', provider: _sp, jobId: _sj, message: { km: 'រក Separation នេះមិនឃើញទេ — វាអាចបរាជ័យ ឬផុតកំណត់ហើយ', en: 'Separation not found — it may have failed or expired' } });
+        }
         const hash = String(qp.get('hash') || '').trim().slice(0, 200);
         if (!hash) return sendJSON(res, 200, { ok: false, error: 'មិនមាន hash ទេ · No separation hash' });
         const keys = await adminProviderKeyList('mvsep');
@@ -9805,6 +10402,34 @@ async function apiRoute(req, res, urlPath) {
       if (!body || !body.locked || typeof body.locked !== 'object' || Array.isArray(body.locked)) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ locked: {vocals, music, drums, bass, piano, guitar}' });
       const out = await vrLocksSave(body.locked);
       return sendJSON(res, 200, { ok: true, locked: out });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  // GET /api/public/split-settings — public (no keys exposed). The
+  // website reads it to show/hide the 6-stem option and the daily
+  // limit state. GET /api/admin/split-settings (admin key) also reports
+  // today's split count for the Admin display. POST
+  // /api/admin/split-settings (admin key) sets the 6-stem lock and the
+  // "ប្រើឥតកំណត់" switch.
+  if (req.method === 'GET' && urlPath === '/api/public/split-settings') {
+    const s = await splitSettingsLoad();
+    return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn });
+  }
+  if (req.method === 'GET' && urlPath === '/api/admin/split-settings') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    const s = await splitSettingsLoad();
+    const t = await splitDailyTotal();
+    return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn, today: t });
+  }
+  if (req.method === 'POST' && urlPath === '/api/admin/split-settings') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ split6Locked / splitLimitsOn' });
+      const out = await splitSettingsSave(body);
+      const t = await splitDailyTotal();
+      return sendJSON(res, 200, { ok: true, split6Locked: out.split6Locked, splitLimitsOn: out.splitLimitsOn, today: t });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
