@@ -9341,19 +9341,35 @@ async function apiRoute(req, res, urlPath) {
         // allowance/credits. The Admin "ប្រើឥតកំណត់" switch OFF
         // (splitLimitsOn false) skips this check entirely.
         if (_splitSettings.splitLimitsOn && (await splitDailyCount(email)) >= SPLIT_DAILY_LIMIT) return sendJSON(res, 200, { ok: false, error: 'ថ្ងៃនេះអ្នកបានបំបែក 2 ដងហើយ — សូមរង់ចាំថ្ងៃស្អែក · You have used your 2 splits for today — please come back tomorrow', code: 'split_daily_limit' });
-        // Free providers (Disband/Doseedo) — owner order 2026-11-24:
-        // the old allowance (package vsLeft / 2 free lifetime uses /
-        // bonus) no longer gates splits in this handler. The 2/day
-        // daily limit (checked above via splitDailyCount) is the only
-        // control. No credits are charged and no allowance is
-        // consumed for these splits.
-        let paid6 = false;
+        // Refined split rule (owner order 2026-11-24 19:50): 2-stem
+        // and 6-stem work the same, combined max 2 fresh splits per
+        // user per day (Phnom Penh day). 1st fresh split of the day is
+        // FREE; the 2nd costs 2 Song Credits from the SPLITTING USER's
+        // own MovAi website account (their songCredits balance — never
+        // the owner's personal account, and never the Disband/Doseedo
+        // provider-side allowance). After the 2nd, locked until
+        // tomorrow. Admin "ប្រើឥតកំណត់" OFF (splitLimitsOn false)
+        // skips both the daily limit and the charge.
+        let paidSplit = false;
         _vsU.updatedAt = new Date().toISOString();
         await saveUsers(_vsUsers);
         scheduleBackup('users.json');
+        // Charge the 2nd fresh split of the day (2 Song Credits).
+        // Done AFTER saveUsers(_vsUsers) above so the fresh deduction
+        // is not overwritten by the stale in-memory user object. If
+        // the user has fewer than 2 Song Credits, refuse WITHOUT
+        // bumping the daily count. The 1st split is free.
+        if (_splitSettings.splitLimitsOn && (await splitDailyCount(email)) === 1) {
+          const _ded = await deductForGeneration(email, 0, 2, 'song:split');
+          if (!_ded.ok) return sendJSON(res, 200, { ok: false, error: 'split_need_credits', code: 'split_need_credits', balance: (typeof _ded.balance === 'number' ? _ded.balance : 0), message: { km: 'Credit មិនគ្រប់ទេ — បំបែកម្ដងទៀតត្រូវការ 2 Song Credits', en: 'Not enough credits — the next split costs 2 Song Credits' } });
+          paidSplit = true;
+        }
         // Fresh separation: count it against the user's 2/day split
         // limit (cached re-splits and resumes above never reach here).
-        await splitDailyBump(email);
+        const _splitUsedAfter = await splitDailyBump(email);
+        const _splitToday = _splitSettings.splitLimitsOn
+          ? { used: _splitUsedAfter, freeLeft: _splitUsedAfter === 0 ? 1 : 0, nextCost: _splitUsedAfter === 1 ? 2 : 0 }
+          : { used: _splitUsedAfter, freeLeft: 1, nextCost: 0 };
         let out;
         try {
           // 30s max in the POST: after that the client polls /status
@@ -9369,15 +9385,15 @@ async function apiRoute(req, res, urlPath) {
           // creating a duplicate — and keep the daily count (the
           // split will finish). No refund for a timeout.
           if (e && e.code === 'split_timeout') {
-            await splitPendingPut(audioUrl, _mode, e.provider || '', e.jobId || '', (typeof e.keyIndex === 'number' ? e.keyIndex : -1), { vr, paid6, email });
-            return sendJSON(res, 200, Object.assign({ ok: false, error: 'split_timeout', code: 'split_timeout', provider: e.provider || '', jobId: e.jobId || '', message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } }, vr ? { charged: paid6 ? VR_COST : 0, freeLeft: Math.max(0, FEATURE_FREE_LIMIT - featureFreeUsed(_vsU, 'freeVsUsed')) } : {}));
+            await splitPendingPut(audioUrl, _mode, e.provider || '', e.jobId || '', (typeof e.keyIndex === 'number' ? e.keyIndex : -1), { vr, paid6: paidSplit, email });
+            return sendJSON(res, 200, Object.assign({ ok: false, error: 'split_timeout', code: 'split_timeout', provider: e.provider || '', jobId: e.jobId || '', message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' }, charged: paidSplit ? 2 : 0, splitToday: _splitToday }));
           }
           // The split FAILED on both providers: it does not count
-          // against the 2/day limit, so un-bump it. A paid Vocal
-          // Remover job also gets its 6 credits refunded once (the
-          // existing rule — free/package allowance is not refunded).
+          // against the 2/day limit, so un-bump it. A paid split also
+          // gets its 2 Song Credits refunded once (to the same
+          // splitting user's website account the charge came from).
           try { await splitDailyUnbump(email); } catch (e2) {}
-          if (paid6) { try { await refundForGeneration(email, 0, VR_COST, 'song:vocal-remover failed'); } catch (e2) {} }
+          if (paidSplit) { try { await refundForGeneration(email, 0, 2, 'song:split failed'); } catch (e2) {} }
           if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'split_no_key', code: 'split_no_key', message: { km: 'Admin មិនទាន់ដាក់ API Key សម្រាប់បំបែកបទទេ', en: 'Admin has not added an API key for splitting yet' } });
           if (e && e.code === 'split_too_big') return sendJSON(res, 200, { ok: false, error: 'ឯកសារធំពេក — អតិបរមា 100 MB · File too big — max 100 MB', code: 'split_too_big' });
           if (e && (e.code === 'disband_bad_audio' || e.code === 'doseedo_bad_audio')) return sendJSON(res, 200, { ok: false, error: 'ឯកសារសំឡេងនេះបំបែកមិនបានទេ · This audio file could not be split', code: 'split_bad_audio' });
@@ -9389,7 +9405,7 @@ async function apiRoute(req, res, urlPath) {
         // provider job id is re-fetched for fresh download URLs).
         await splitPendingRemoveByAudio(audioUrl, _mode);
         await splitCachePut(audioUrl, _mode, out.provider, out.jobId, out.keyIndex);
-        return sendJSON(res, 200, Object.assign({ ok: true, provider: out.provider, jobId: out.jobId, songTitle, stems: vr ? splitVrRows(out.provider, out.stems, _locks) : out.stems, midi: out.midi || null }, vr ? { charged: paid6 ? VR_COST : 0, freeLeft: Math.max(0, FEATURE_FREE_LIMIT - featureFreeUsed(_vsU, 'freeVsUsed')) } : {}));
+        return sendJSON(res, 200, Object.assign({ ok: true, provider: out.provider, jobId: out.jobId, songTitle, stems: vr ? splitVrRows(out.provider, out.stems, _locks) : out.stems, midi: out.midi || null, charged: paidSplit ? 2 : 0, splitToday: _splitToday }));
       } catch (e) { return sendJSON(res, 200, { ok: false, error: 'MovAi: ' + (e && e.message ? String(e.message).replace(/^MVSEP:\s*/, '').slice(0, 200) : 'request failed') }); }
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
@@ -10397,7 +10413,13 @@ async function apiRoute(req, res, urlPath) {
   // "ប្រើឥតកំណត់" switch.
   if (req.method === 'GET' && urlPath === '/api/public/split-settings') {
     const s = await splitSettingsLoad();
-    return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn });
+    const _em = normEmail(new URL(req.url, 'http://localhost').searchParams.get('email') || '');
+    if (!_em) return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn });
+    const _used = await splitDailyCount(_em);
+    const _daily = s.splitLimitsOn
+      ? { usedToday: _used, freeLeft: _used === 0 ? 1 : 0, nextCost: _used === 1 ? 2 : 0, lockedToday: _used >= SPLIT_DAILY_LIMIT }
+      : { usedToday: _used, freeLeft: 1, nextCost: 0, lockedToday: false };
+    return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn, daily: _daily });
   }
   if (req.method === 'GET' && urlPath === '/api/admin/split-settings') {
     const a = await adminKeyOk(req);
