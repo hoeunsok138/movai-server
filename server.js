@@ -9341,29 +9341,13 @@ async function apiRoute(req, res, urlPath) {
         // allowance/credits. The Admin "ប្រើឥតកំណត់" switch OFF
         // (splitLimitsOn false) skips this check entirely.
         if (_splitSettings.splitLimitsOn && (await splitDailyCount(email)) >= SPLIT_DAILY_LIMIT) return sendJSON(res, 200, { ok: false, error: 'ថ្ងៃនេះអ្នកបានបំបែក 2 ដងហើយ — សូមរង់ចាំថ្ងៃស្អែក · You have used your 2 splits for today — please come back tomorrow', code: 'split_daily_limit' });
-        // "Free 2 + package allowance" — consumed only now, for a
-        // fresh separation. Package allowance first, then the 2 free
-        // uses, then bonus. A fresh separation that later fails or
-        // times out still consumes (same as the generation-credit
-        // pattern: checked + deducted up front).
-        // Package allowance is spendable ONLY while a package is
-        // active. An expired package's remaining vsLeft is LOST —
-        // never spent; go straight to the lifetime Free 2 instead.
-        // Vocal Remover (owner order 2026-11-23): 2 free uses,
-        // then 6 SONG credits from the user's own MovAi account (the
-        // credits from the package they bought) — NEVER Suno credits.
-        // The 6-stem Studio keeps the old package/free/bonus allowance.
+        // Free providers (Disband/Doseedo) — owner order 2026-11-24:
+        // the old allowance (package vsLeft / 2 free lifetime uses /
+        // bonus) no longer gates splits in this handler. The 2/day
+        // daily limit (checked above via splitDailyCount) is the only
+        // control. No credits are charged and no allowance is
+        // consumed for these splits.
         let paid6 = false;
-        if (vr && featureFreeUsed(_vsU, 'freeVsUsed') < FEATURE_FREE_LIMIT) { _vsU.freeVsUsed = featureFreeUsed(_vsU, 'freeVsUsed') + 1; }
-        else if (vr) {
-          const _ded = await deductForGeneration(email, 0, VR_COST, 'song:vocal-remover');
-          if (!_ded.ok) return sendJSON(res, 200, { ok: false, error: _ded.error || 'Song Credit មិនគ្រប់ទេ', needBuy: true, kind: 'song', balance: _ded.balance, cost: VR_COST });
-          paid6 = true;
-        }
-        else if (hasActivePackage(_vsU) && (_vsU.vsUnlimited || featurePkgLeft(_vsU, 'vsLeft') > 0)) { if (!_vsU.vsUnlimited) _vsU.vsLeft = featurePkgLeft(_vsU, 'vsLeft') - 1; }
-        else if (featureFreeUsed(_vsU, 'freeVsUsed') < FEATURE_FREE_LIMIT) { _vsU.freeVsUsed = featureFreeUsed(_vsU, 'freeVsUsed') + 1; }
-        else if (featureBonus(_vsU, 'bonusVs') > 0) { _vsU.bonusVs = featureBonus(_vsU, 'bonusVs') - 1; }
-        else return sendJSON(res, 200, { ok: false, error: 'vs_out', message: 'You have used your 2 free Vocal Studio splits and have no allowance left — please buy a song package to continue.' });
         _vsU.updatedAt = new Date().toISOString();
         await saveUsers(_vsUsers);
         scheduleBackup('users.json');
