@@ -4452,6 +4452,34 @@ async function splitSettingsSave(patch) {
   await saveKvDoc('split-settings', out, 'split-settings.json');
   return out;
 }
+// ---- Feature settings: Video Generate + Music Video locks (Admin,
+// owner order 2026-11-24) ----
+// kv_doc 'feature-settings': {mvLocked, videoGenLocked, at}.
+// videoGenLocked default true: Video Generate (AI video, chat page,
+// POST /api/gen/video, Magic Hour) is LOCKED by default until the
+// owner unlocks it in Admin. mvLocked default false: Music Video
+// (karaoke video, POST /api/mv/lyrics) works by default until the
+// owner locks it in Admin. The owner's literal toggle semantics are
+// BACKWARDS from convention — same as the split toggles: toggle OFF
+// (បិទ) = the feature WORKS, toggle ON (បើក) = the feature is BLOCKED
+// and must not run.
+async function featureSettingsLoad() {
+  try {
+    const j = await loadKvDoc('feature-settings', null);
+    if (!j || typeof j !== 'object') return { mvLocked: false, videoGenLocked: true };
+    return { mvLocked: j.mvLocked === true, videoGenLocked: j.videoGenLocked !== false };
+  } catch (e) { return { mvLocked: false, videoGenLocked: true }; }
+}
+async function featureSettingsSave(patch) {
+  const cur = await featureSettingsLoad();
+  const out = {
+    mvLocked: patch && typeof patch.mvLocked === 'boolean' ? patch.mvLocked : cur.mvLocked,
+    videoGenLocked: patch && typeof patch.videoGenLocked === 'boolean' ? patch.videoGenLocked : cur.videoGenLocked,
+    at: Date.now(),
+  };
+  await saveKvDoc('feature-settings', out, 'feature-settings.json');
+  return out;
+}
 function splitTodayStr() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Phnom_Penh' });
 }
@@ -7416,6 +7444,11 @@ async function apiRoute(req, res, urlPath) {
         if (typeof body.email === 'string') genCtx.email = body.email;
       }
       try {
+        // Video Generate lock (owner order 2026-11-24): locked by
+        // default; when locked, refuse BEFORE any credit deduction
+        // or provider call.
+        const _fs = await featureSettingsLoad();
+        if (_fs.videoGenLocked) return sendJSON(res, 200, { ok: false, error: 'Video Generate ត្រូវបានបិទដោយ Admin · Video generation is disabled by the Admin', code: 'video_gen_locked' });
         if (!body || typeof body.prompt !== 'string' || !body.prompt.trim()) return sendJSON(res, 200, { ok: false, error: 'សូមសរសេរ prompt ជាមុនសិន' });
         if (!normEmail(body.email)) return sendJSON(res, 200, { ok: false, error: 'សូមចូលគណនេយ្យជាមុនសិន · Please sign in first', needLogin: true });
         const provider = body.provider;
@@ -10606,6 +10639,32 @@ async function apiRoute(req, res, urlPath) {
       const out = await splitSettingsSave(body);
       const t = await splitDailyTotal();
       return sendJSON(res, 200, { ok: true, split6Locked: out.split6Locked, splitLimitsOn: out.splitLimitsOn, disbandBlocked: out.disbandBlocked, doseedoBlocked: out.doseedoBlocked, today: t });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  // GET /api/public/feature-settings — public (no keys exposed). The
+  // website reads it to lock/unlock Video Generate and Music Video.
+  // GET /api/admin/feature-settings (admin key) reports the same.
+  // POST /api/admin/feature-settings (admin key) sets mvLocked /
+  // videoGenLocked. Toggle semantics (owner's literal wording,
+  // backwards from convention): OFF = feature works, ON = blocked.
+  if (req.method === 'GET' && urlPath === '/api/public/feature-settings') {
+    const f = await featureSettingsLoad();
+    return sendJSON(res, 200, { ok: true, mvLocked: f.mvLocked, videoGenLocked: f.videoGenLocked });
+  }
+  if (req.method === 'GET' && urlPath === '/api/admin/feature-settings') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    const f = await featureSettingsLoad();
+    return sendJSON(res, 200, { ok: true, mvLocked: f.mvLocked, videoGenLocked: f.videoGenLocked });
+  }
+  if (req.method === 'POST' && urlPath === '/api/admin/feature-settings') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ mvLocked / videoGenLocked' });
+      const out = await featureSettingsSave(body);
+      return sendJSON(res, 200, { ok: true, mvLocked: out.mvLocked, videoGenLocked: out.videoGenLocked });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
@@ -14354,6 +14413,10 @@ async function apiRoute(req, res, urlPath) {
   }
   if (req.method === 'POST' && urlPath === '/api/mv/lyrics') {
     readJSONBody(req, 64 * 1024).then(async (body) => {
+      // Music Video lock (owner order 2026-11-24): when locked,
+      // refuse BEFORE doing the transcription work.
+      const _fs = await featureSettingsLoad();
+      if (_fs.mvLocked) return sendJSON(res, 200, { ok: false, error: 'Music Video ត្រូវបានបិទដោយ Admin · Music Video is disabled by the Admin', code: 'mv_locked' });
       await logActivity({ at: new Date().toISOString(), mode: 'mv-lyrics' });
       const audioUrl = body && typeof body.audioUrl === 'string' ? body.audioUrl.trim() : '';
       const translateTo = body && typeof body.translateTo === 'string' ? body.translateTo.trim().slice(0, 50) : '';
