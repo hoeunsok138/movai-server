@@ -1052,6 +1052,30 @@ function hasActivePackage(u) {
   if (s && s > now) return true;
   return false;
 }
+// Premium rollover (owner order 2026-11-24, refined 2026-11-24 21:44-21:48):
+// in the LAST 2 DAYS of an active Premium plan (days 29-30), a renewal
+// caps the old leftover Song Credits at 120 — keep at most 120
+// (e.g. 360 -> 120; 80 -> keep all 80). If the balance is 0 in that
+// window, the user still gets +120. Outside the window (days 1-28)
+// buying just adds normally, no cap. `atMs` is the moment the purchase
+// was made: for a purchase-request approve it is the request's createdAt
+// (the user bought while in the window even if the admin approves later);
+// for a wallet buy it is now (the buy is instant). An already-expired
+// plan is left alone (normal add) — the owner has not yet decided
+// strict (leftover = 0) vs lenient for buying-new-after-expiry.
+// Returns true when the cap/bonus was applied. Call BEFORE adding the
+// new package credits. Premium only.
+function applyPremiumRollover(u, packageId, atMs) {
+  if (packageId !== 'premium') return false;
+  if (!u || u.songPlan !== 'premium') return false;
+  const exp = Date.parse(u.songPlanExpiresAt || '');
+  if (!exp) return false;
+  const ms = exp - atMs;
+  if (ms <= 0 || ms > 2 * 86400000) return false;
+  const bal = Math.max(0, Math.floor(numOr(u.songCredits, 0)));
+  u.songCredits = bal === 0 ? 120 : Math.min(bal, 120);
+  return true;
+}
 // Weekly public-post limits (owner order 2026-11-21, v2.2.60):
 // $5 song-trial = 10/week, $10 song-popular = 20/week,
 // $30 song-30 = 30/week, $50 song-50 = unlimited,
@@ -12347,6 +12371,11 @@ async function apiRoute(req, res, urlPath) {
       // lost and the new grant must NOT stack on it (see
       // grantFeatureAllowance). If still active, the grant accumulates.
       const _hadActivePkg = hasActivePackage(u);
+      // Premium rollover: the signal is the REQUEST's createdAt (when the
+      // user bought), not the approval time — the admin may approve
+      // after the 2-day window.
+      const _rollAt = Date.parse(r.createdAt || '') || Date.now();
+      const _rolled = applyPremiumRollover(u, r.packageId, _rollAt);
       u.credits = Math.max(0, Math.floor(numOr(u.credits, 0)) + pkg.credits);
       u.songCredits = Math.max(0, Math.floor(numOr(u.songCredits, 0)) + pkg.songCredits);
       if (pkg.credits) { u.plan = r.packageId; u.planExpiresAt = new Date(Date.now() + Math.max(1, pkg.days || 30) * 86400000).toISOString(); }
@@ -12371,7 +12400,7 @@ async function apiRoute(req, res, urlPath) {
       }
       u.updatedAt = now;
       await saveUsers(users);
-      await logGrant({ email: r.email, credits: pkg.credits, songCredits: pkg.songCredits, note: 'purchase:' + r.packageId, at: now });
+      await logGrant({ email: r.email, credits: pkg.credits, songCredits: pkg.songCredits, note: 'purchase:' + r.packageId + (_rolled ? ':rollover120' : ''), at: now });
       r.status = 'approved';
       r.decidedAt = now;
       r.updatedAt = now;
@@ -12540,6 +12569,9 @@ async function apiRoute(req, res, urlPath) {
       // an active package's grant accumulates.
       const _hadActivePkg = hasActivePackage(u);
       u.balance = walletMoney(bal - price);
+      // Premium rollover: same rule as the purchase-request approve —
+      // a wallet buy is instant, so the signal is now.
+      const _rolledW = applyPremiumRollover(u, packageId, Date.now());
       u.credits = Math.max(0, Math.floor(numOr(u.credits, 0)) + pkg.credits);
       u.songCredits = Math.max(0, Math.floor(numOr(u.songCredits, 0)) + pkg.songCredits);
       await notifyWalletDeduct(email, price, 'Wallet', 'ទិញ Package · package ' + packageId, u.balance);
@@ -12564,7 +12596,7 @@ async function apiRoute(req, res, urlPath) {
       }
       u.updatedAt = now;
       await saveUsers(users);
-      await logGrant({ email, credits: pkg.credits, songCredits: pkg.songCredits, note: 'wallet-buy:' + packageId, at: now });
+      await logGrant({ email, credits: pkg.credits, songCredits: pkg.songCredits, note: 'wallet-buy:' + packageId + (_rolledW ? ':rollover120' : ''), at: now });
       scheduleBackup('users.json');
       const _pdw = pkgDisplay(pkg);
       await addNotification('purchase-approved', email, '✅ បានទិញកញ្ចប់ដោយ Wallet · Package bought with Wallet', pkgNotifText(pkg, email, u.id || '—') + ' — បង់ដោយ Wallet $' + price.toFixed(2) + ' (នៅសល់ $' + u.balance.toFixed(2) + ')', { extra: { pkg: packageId, pkgName: _pdw.pkgName, priceText: _pdw.priceText, creditText: _pdw.creditText, buyerId: u.id || '—', decision: 'approved', paidBy: 'wallet', price }, telegramHtml: pkgNotifTelegram('✅ បានទិញកញ្ចប់ដោយ Wallet · Package bought with Wallet', pkg, email, u.id || '—') });
