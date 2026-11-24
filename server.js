@@ -4371,7 +4371,7 @@ const SPLIT_STEM_ORDER = ['vocals', 'music', 'drums', 'bass', 'guitar', 'piano',
 const DISBAND_STEM_MAP = { vocals: 'vocals', instrumental: 'music', 'instrumental.drums': 'drums', 'instrumental.bass': 'bass', 'instrumental.guitar': 'guitar', 'instrumental.piano': 'piano', 'instrumental.other': 'other' };
 
 // ---- Split settings (Admin-controlled, owner order 2026-11-24) ----
-// kv_doc 'split-settings': {split6Locked, splitLimitsOn, at}.
+// kv_doc 'split-settings': {split6Locked, splitLimitsOn, disbandBlocked, doseedoBlocked, at}.
 // split6Locked default true: 6-stem Studio is locked, only the 2-stem
 // Vocal Remover is usable until the owner unlocks it in Admin.
 // splitLimitsOn default true: the 2/day limit applies. The Admin
@@ -4379,18 +4379,27 @@ const DISBAND_STEM_MAP = { vocals: 'vocals', instrumental: 'music', 'instrumenta
 // literal semantics are: ON = normal limits apply (2/day), OFF =
 // unlimited, no limits (for owner testing). The 6-stem lock is
 // INDEPENDENT of this switch.
+// disbandBlocked / doseedoBlocked default false: one on/off toggle per
+// stem-split API in Admin (owner order 2026-11-24 20:09). The owner's
+// literal semantics are BACKWARDS from the usual convention — same as
+// the "ប្រើឥតកំណត់" switch: toggle OFF (បិទ) = the provider WORKS,
+// toggle ON (បើក) = the provider is BLOCKED and must not run. A
+// blocked provider is never called by the router, and cached/pending
+// jobs from a blocked provider are never resumed.
 async function splitSettingsLoad() {
   try {
     const j = await loadKvDoc('split-settings', null);
-    if (!j || typeof j !== 'object') return { split6Locked: true, splitLimitsOn: true };
-    return { split6Locked: j.split6Locked !== false, splitLimitsOn: j.splitLimitsOn !== false };
-  } catch (e) { return { split6Locked: true, splitLimitsOn: true }; }
+    if (!j || typeof j !== 'object') return { split6Locked: true, splitLimitsOn: true, disbandBlocked: false, doseedoBlocked: false };
+    return { split6Locked: j.split6Locked !== false, splitLimitsOn: j.splitLimitsOn !== false, disbandBlocked: j.disbandBlocked === true, doseedoBlocked: j.doseedoBlocked === true };
+  } catch (e) { return { split6Locked: true, splitLimitsOn: true, disbandBlocked: false, doseedoBlocked: false }; }
 }
 async function splitSettingsSave(patch) {
   const cur = await splitSettingsLoad();
   const out = {
     split6Locked: patch && typeof patch.split6Locked === 'boolean' ? patch.split6Locked : cur.split6Locked,
     splitLimitsOn: patch && typeof patch.splitLimitsOn === 'boolean' ? patch.splitLimitsOn : cur.splitLimitsOn,
+    disbandBlocked: patch && typeof patch.disbandBlocked === 'boolean' ? patch.disbandBlocked : cur.disbandBlocked,
+    doseedoBlocked: patch && typeof patch.doseedoBlocked === 'boolean' ? patch.doseedoBlocked : cur.doseedoBlocked,
     at: Date.now(),
   };
   await saveKvDoc('split-settings', out, 'split-settings.json');
@@ -4842,26 +4851,45 @@ async function splitPollJob(provider, keyValue, jobId, waitS) {
 // second job for the same song). Returns the provider result
 // {provider, jobId, stems, midi, keyIndex} or throws the final error.
 async function splitSeparateWithProviders(bytes, filename, isVr, maxWaitMs) {
-  const disbandKeys = await adminProviderKeyList('disband');
-  let usedKey = '';
-  try {
-    const out = await withProviderKeyRotation('disband', async (k) => { usedKey = k; return disbandSeparate(k, bytes, filename, isVr, maxWaitMs); });
-    out.keyIndex = disbandKeys.findIndex((e) => e.key === usedKey);
-    return out;
-  } catch (e) {
-    if (e && e.code === 'split_timeout') { e.keyIndex = disbandKeys.findIndex((e2) => e2.key === usedKey); throw e; }
-    if (e && (e.code === 'disband_bad_audio' || e.httpStatus === 400)) throw e;
+  // Provider on/off toggles (Admin, split-settings): toggle OFF =
+  // provider WORKS, toggle ON = provider BLOCKED and must not run.
+  // A blocked provider is never called. Both blocked -> the handler
+  // reports split_no_provider (nothing is attempted).
+  const _ss = await splitSettingsLoad();
+  if (_ss.disbandBlocked && _ss.doseedoBlocked) {
+    const _e = new Error('split_no_provider'); _e.code = 'split_no_provider'; throw _e;
   }
-  const doseedoKeys = await adminProviderKeyList('doseedo');
-  let usedKey2 = '';
-  try {
-    const out = await withProviderKeyRotation('doseedo', async (k) => { usedKey2 = k; return doseedoSeparate(k, bytes, filename, isVr, maxWaitMs); });
-    out.keyIndex = doseedoKeys.findIndex((e) => e.key === usedKey2);
-    return out;
-  } catch (e) {
-    if (e && e.code === 'split_timeout') e.keyIndex = doseedoKeys.findIndex((e2) => e2.key === usedKey2);
-    throw e;
+  let _lastErr = null;
+  if (!_ss.disbandBlocked) {
+    const disbandKeys = await adminProviderKeyList('disband');
+    let usedKey = '';
+    try {
+      const out = await withProviderKeyRotation('disband', async (k) => { usedKey = k; return disbandSeparate(k, bytes, filename, isVr, maxWaitMs); });
+      out.keyIndex = disbandKeys.findIndex((e) => e.key === usedKey);
+      return out;
+    } catch (e) {
+      if (e && e.code === 'split_timeout') { e.keyIndex = disbandKeys.findIndex((e2) => e2.key === usedKey); throw e; }
+      if (e && (e.code === 'disband_bad_audio' || e.httpStatus === 400)) throw e;
+      _lastErr = e;
+    }
   }
+  if (!_ss.doseedoBlocked) {
+    const doseedoKeys = await adminProviderKeyList('doseedo');
+    let usedKey2 = '';
+    try {
+      const out = await withProviderKeyRotation('doseedo', async (k) => { usedKey2 = k; return doseedoSeparate(k, bytes, filename, isVr, maxWaitMs); });
+      out.keyIndex = doseedoKeys.findIndex((e) => e.key === usedKey2);
+      return out;
+    } catch (e) {
+      if (e && e.code === 'split_timeout') e.keyIndex = doseedoKeys.findIndex((e2) => e2.key === usedKey2);
+      throw e;
+    }
+  }
+  // The only unblocked provider failed and the other is blocked:
+  // surface the first provider's error (e.g. noKey) so the handler
+  // maps it the same way as before; otherwise a generic failure.
+  if (_lastErr) throw _lastErr;
+  const _e2 = new Error('split_failed'); _e2.code = 'split_failed'; throw _e2;
 }
 // Shape new-provider stems for the Vocal Remover response. Disband VR
 // is a true 2-stem split, so it goes through the Admin VR locks like
@@ -9305,6 +9333,9 @@ async function apiRoute(req, res, urlPath) {
         // Remover is always available.
         const _splitSettings = await splitSettingsLoad();
         if (!vr && _splitSettings.split6Locked) return sendJSON(res, 200, { ok: false, error: '6 ស្ទេមត្រូវបានចាក់សោដោយ Admin — សូមប្រើ 2 សំឡេងសិន · 6-stem splitting is locked by the Admin — please use 2 sounds for now', code: 'split6_locked' });
+        // Both split APIs blocked (Admin toggles): refuse before any
+        // counting, charging, or provider call — nothing is spent.
+        if (_splitSettings.disbandBlocked && _splitSettings.doseedoBlocked) return sendJSON(res, 200, { ok: false, error: 'split_no_provider', code: 'split_no_provider', message: { km: 'Admin បានបិទ API បំបែកទាំងពីរ', en: 'Admin has disabled both split APIs' } });
         // Fast path: this song was separated before with Disband or
         // Doseedo — ask that provider for the OLD job's fresh stem URLs
         // instead of creating (and paying quota for) a new separation.
@@ -9313,7 +9344,11 @@ async function apiRoute(req, res, urlPath) {
         // resumes via the status endpoint (no second job, no extra
         // quota). Any failure falls through to a fresh separation below.
         const _cachedJob = await splitCacheGet(audioUrl, _mode);
-        if (_cachedJob) {
+        // A cached job from a provider the Admin has now blocked must
+        // not be resumed — fall through to a fresh split with an
+        // allowed provider instead.
+        const _cachedBlocked = !!(_cachedJob && ((_cachedJob.provider === 'disband' && _splitSettings.disbandBlocked) || (_cachedJob.provider === 'doseedo' && _splitSettings.doseedoBlocked)));
+        if (_cachedJob && !_cachedBlocked) {
           try {
             const _keys = await adminProviderKeyList(_cachedJob.provider);
             const _ordered = _cachedJob.keyIndex >= 0 && _keys[_cachedJob.keyIndex] ? [_keys[_cachedJob.keyIndex]].concat(_keys.filter((_, i) => i !== _cachedJob.keyIndex)) : _keys;
@@ -9332,7 +9367,10 @@ async function apiRoute(req, res, urlPath) {
         // (created by an earlier tap that timed out on our side).
         // Resume THAT job instead of creating a duplicate.
         const _pendingJob = await splitPendingGetByAudio(audioUrl, _mode);
-        if (_pendingJob) {
+        // Same as the cache above: never resume a blocked provider's
+        // in-flight job — fall through to a fresh split instead.
+        const _pendingBlocked = !!(_pendingJob && ((_pendingJob.provider === 'disband' && _splitSettings.disbandBlocked) || (_pendingJob.provider === 'doseedo' && _splitSettings.doseedoBlocked)));
+        if (_pendingJob && !_pendingBlocked) {
           return sendJSON(res, 200, { ok: false, error: 'split_timeout', code: 'split_timeout', provider: _pendingJob.provider, jobId: _pendingJob.jobId, message: { km: 'MovAi កំពុងបំបែកបទនេះ — សូមរង់ចាំបន្តិច ហើយចុច Split (AI) ម្តងទៀត', en: 'MovAi is still separating this song — please wait a bit and tap Split (AI) again' } });
         }
         // Daily limit: 2 fresh separations per user per day (both modes
@@ -9394,6 +9432,7 @@ async function apiRoute(req, res, urlPath) {
           // splitting user's website account the charge came from).
           try { await splitDailyUnbump(email); } catch (e2) {}
           if (paidSplit) { try { await refundForGeneration(email, 0, 2, 'song:split failed'); } catch (e2) {} }
+          if (e && e.code === 'split_no_provider') return sendJSON(res, 200, { ok: false, error: 'split_no_provider', code: 'split_no_provider', message: { km: 'Admin បានបិទ API បំបែកទាំងពីរ', en: 'Admin has disabled both split APIs' } });
           if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'split_no_key', code: 'split_no_key', message: { km: 'Admin មិនទាន់ដាក់ API Key សម្រាប់បំបែកបទទេ', en: 'Admin has not added an API key for splitting yet' } });
           if (e && e.code === 'split_too_big') return sendJSON(res, 200, { ok: false, error: 'ឯកសារធំពេក — អតិបរមា 100 MB · File too big — max 100 MB', code: 'split_too_big' });
           if (e && (e.code === 'disband_bad_audio' || e.code === 'doseedo_bad_audio')) return sendJSON(res, 200, { ok: false, error: 'ឯកសារសំឡេងនេះបំបែកមិនបានទេ · This audio file could not be split', code: 'split_bad_audio' });
@@ -10409,24 +10448,25 @@ async function apiRoute(req, res, urlPath) {
   // website reads it to show/hide the 6-stem option and the daily
   // limit state. GET /api/admin/split-settings (admin key) also reports
   // today's split count for the Admin display. POST
-  // /api/admin/split-settings (admin key) sets the 6-stem lock and the
-  // "ប្រើឥតកំណត់" switch.
+  // /api/admin/split-settings (admin key) sets the 6-stem lock, the
+  // "ប្រើឥតកំណត់" switch, and the per-provider Disband/Doseedo
+  // on/off toggles.
   if (req.method === 'GET' && urlPath === '/api/public/split-settings') {
     const s = await splitSettingsLoad();
     const _em = normEmail(new URL(req.url, 'http://localhost').searchParams.get('email') || '');
-    if (!_em) return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn });
+    if (!_em) return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn, disbandBlocked: s.disbandBlocked, doseedoBlocked: s.doseedoBlocked });
     const _used = await splitDailyCount(_em);
     const _daily = s.splitLimitsOn
       ? { usedToday: _used, freeLeft: _used === 0 ? 1 : 0, nextCost: _used === 1 ? 2 : 0, lockedToday: _used >= SPLIT_DAILY_LIMIT }
       : { usedToday: _used, freeLeft: 1, nextCost: 0, lockedToday: false };
-    return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn, daily: _daily });
+    return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn, disbandBlocked: s.disbandBlocked, doseedoBlocked: s.doseedoBlocked, daily: _daily });
   }
   if (req.method === 'GET' && urlPath === '/api/admin/split-settings') {
     const a = await adminKeyOk(req);
     if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
     const s = await splitSettingsLoad();
     const t = await splitDailyTotal();
-    return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn, today: t });
+    return sendJSON(res, 200, { ok: true, split6Locked: s.split6Locked, splitLimitsOn: s.splitLimitsOn, disbandBlocked: s.disbandBlocked, doseedoBlocked: s.doseedoBlocked, today: t });
   }
   if (req.method === 'POST' && urlPath === '/api/admin/split-settings') {
     const a = await adminKeyOk(req);
@@ -10435,7 +10475,7 @@ async function apiRoute(req, res, urlPath) {
       if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ split6Locked / splitLimitsOn' });
       const out = await splitSettingsSave(body);
       const t = await splitDailyTotal();
-      return sendJSON(res, 200, { ok: true, split6Locked: out.split6Locked, splitLimitsOn: out.splitLimitsOn, today: t });
+      return sendJSON(res, 200, { ok: true, split6Locked: out.split6Locked, splitLimitsOn: out.splitLimitsOn, disbandBlocked: out.disbandBlocked, doseedoBlocked: out.doseedoBlocked, today: t });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
