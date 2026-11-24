@@ -9469,7 +9469,7 @@ async function apiRoute(req, res, urlPath) {
     }
     return { ok: true, buf: Buffer.concat(chunks), contentType: ct };
   }
-  async function mvLyricsWhisper(buf, fileName, key) {
+  async function mvLyricsWhisper(buf, fileName, key, lang) {
     // Returns {ok:true, language, lyrics}. Throws rotErr on failure so
     // withProviderKeyRotation can rotate on 429/auth errors; other
     // failures (e.g. a 400 for bad audio) fail immediately without
@@ -9478,6 +9478,12 @@ async function apiRoute(req, res, urlPath) {
     fd.append('file', new Blob([buf], { type: mvLyricsMime(fileName) }), fileName);
     fd.append('model', 'whisper-large-v3-turbo');
     fd.append('response_format', 'verbose_json');
+    // Khmer fix: telling Whisper the language stops it guessing wrong
+    // and mixing English words into Khmer lyrics. Word timestamps let
+    // the MV page highlight word by word and split long lines exactly.
+    if (lang && /^[a-z]{2,3}$/.test(lang)) fd.append('language', lang);
+    fd.append('timestamp_granularities[]', 'word');
+    fd.append('timestamp_granularities[]', 'segment');
     let r;
     try {
       r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
@@ -9495,13 +9501,31 @@ async function apiRoute(req, res, urlPath) {
       throw rotErr('Whisper: ' + String(em).slice(0, 200), r.status);
     }
     const segs = Array.isArray(j && j.segments) ? j.segments : [];
+    const topWords = Array.isArray(j && j.words) ? j.words : null;
     const lyrics = [];
     for (const s of segs) {
       const text = s && typeof s.text === 'string' ? s.text.trim() : '';
       if (!text) continue;
       const start = typeof s.start === 'number' && isFinite(s.start) ? Math.max(0, Math.round(s.start * 100) / 100) : 0;
       const end = typeof s.end === 'number' && isFinite(s.end) ? Math.max(start, Math.round(s.end * 100) / 100) : start;
-      lyrics.push({ text, start, end });
+      // Word-level timings: segment words first, else top-level words
+      // filtered to this segment's range.
+      let wlist = Array.isArray(s.words) ? s.words : null;
+      if (!wlist && topWords) wlist = topWords.filter((w) => typeof w.start === 'number' && w.start >= start - 0.05 && w.start < end + 0.05);
+      const words = [];
+      if (wlist) {
+        for (const w of wlist) {
+          const wt = typeof w.word === 'string' ? w.word.trim() : '';
+          const ws = typeof w.start === 'number' && isFinite(w.start) ? Math.max(0, Math.round(w.start * 100) / 100) : null;
+          if (!wt || ws === null) continue;
+          let we = typeof w.end === 'number' && isFinite(w.end) ? Math.round(w.end * 100) / 100 : null;
+          if (we === null || we <= ws) we = ws + 0.2;
+          words.push({ word: wt, start: ws, end: we });
+        }
+      }
+      const line = { text, start, end };
+      if (words.length) line.words = words;
+      lyrics.push(line);
       if (lyrics.length % 50 === 0) await new Promise((res2) => setImmediate(res2));
     }
     const language = j && typeof j.language === 'string' ? j.language.trim().toLowerCase() : '';
@@ -14440,7 +14464,7 @@ async function apiRoute(req, res, urlPath) {
     if (isMp3) { const r = await mvLyricsSplitMp3(buf); if (r) return r; }
     return mvLyricsSplitGeneric(buf);
   }
-  async function mvLyricsTranscribeChunked(buf, fileName, contentType) {
+  async function mvLyricsTranscribeChunked(buf, fileName, contentType, lang) {
     // Transcribe a large buffer piece by piece (each <=20 MB) and
     // combine the segments with correct start-time offsets. Throws
     // rotErr/noKey from Whisper (caller maps them). Returns
@@ -14451,7 +14475,7 @@ async function apiRoute(req, res, urlPath) {
     let language = '';
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
-      const r = await withProviderKeyRotation('groq', async (k) => mvLyricsWhisper(part.buf, fileName, k));
+      const r = await withProviderKeyRotation('groq', async (k) => mvLyricsWhisper(part.buf, fileName, k, lang));
       if (!language && r.language) language = r.language;
       perChunk.push({ lyrics: r.lyrics || [], exact: part.exact, exactStart: part.start, bytesBefore: part.bytesBefore, bufLen: part.buf.length });
       await new Promise((res2) => setImmediate(res2));
@@ -14470,17 +14494,19 @@ async function apiRoute(req, res, urlPath) {
     for (const c of perChunk) {
       const start = c.exact ? c.exactStart : (c.bytesBefore / bytesPerSec);
       for (const s of c.lyrics) {
-        all.push({ text: s.text, start: Math.round((start + s.start) * 100) / 100, end: Math.round((start + s.end) * 100) / 100 });
+        const ln = { text: s.text, start: Math.round((start + s.start) * 100) / 100, end: Math.round((start + s.end) * 100) / 100 };
+        if (Array.isArray(s.words) && s.words.length) ln.words = s.words.map((w) => ({ word: w.word, start: Math.round((start + w.start) * 100) / 100, end: Math.round((start + w.end) * 100) / 100 }));
+        all.push(ln);
       }
     }
     all.sort((a, b) => a.start - b.start);
     return { ok: true, language, lyrics: all };
   }
-  async function mvLyricsWhisperSingle(buf, fileName) {
+  async function mvLyricsWhisperSingle(buf, fileName, lang) {
     // One Whisper call through key rotation. Throws rotErr/noKey.
-    return withProviderKeyRotation('groq', async (k) => mvLyricsWhisper(buf, fileName, k));
+    return withProviderKeyRotation('groq', async (k) => mvLyricsWhisper(buf, fileName, k, lang));
   }
-  async function mvLyricsTranscribeSong(audioUrl) {
+  async function mvLyricsTranscribeSong(audioUrl, lang) {
     // Full transcription flow for one audio URL. Returns
     // {ok:true, language, lyrics} or {ok:false, error} (Khmer+English).
     // Throws rotErr/noKey from Whisper (caller maps them to the no-key /
@@ -14488,7 +14514,7 @@ async function apiRoute(req, res, urlPath) {
     // 1) Fast path: small file, one Whisper call.
     const fast = await mvLyricsFetchAudio(audioUrl);
     if (fast.ok) {
-      return mvLyricsWhisperSingle(fast.buf, mvLyricsFileName(fast.contentType, audioUrl));
+      return mvLyricsWhisperSingle(fast.buf, mvLyricsFileName(fast.contentType, audioUrl), lang);
     }
     if (!fast.tooLarge) {
       return { ok: false, error: 'ទាញយកបទចម្រៀងមិនបាន · Could not download the song audio' };
@@ -14504,7 +14530,7 @@ async function apiRoute(req, res, urlPath) {
       const low = mvLyricsCloudinaryLowBitrateUrl(audioUrl);
       if (low) {
         const l = await mvLyricsFetchAudio(low);
-        if (l.ok) return mvLyricsWhisperSingle(l.buf, 'song.mp3');
+        if (l.ok) return mvLyricsWhisperSingle(l.buf, 'song.mp3', lang);
         // Low-bitrate variant unfetchable or still too large — chunking below.
       }
     } else if (await cloudinaryConfigured()) {
@@ -14514,12 +14540,12 @@ async function apiRoute(req, res, urlPath) {
       }
       if (stored && stored.mp3Url) {
         const m = await mvLyricsFetchAudio(stored.mp3Url);
-        if (m.ok) return mvLyricsWhisperSingle(m.buf, 'song.mp3');
+        if (m.ok) return mvLyricsWhisperSingle(m.buf, 'song.mp3', lang);
         if (m.tooLarge) {
           const low = mvLyricsCloudinaryLowBitrateUrl(stored.mp3Url);
           if (low) {
             const l = await mvLyricsFetchAudio(low);
-            if (l.ok) return mvLyricsWhisperSingle(l.buf, 'song.mp3');
+            if (l.ok) return mvLyricsWhisperSingle(l.buf, 'song.mp3', lang);
           }
         }
         // Stored MP3 unfetchable or still too large — chunking below.
@@ -14539,7 +14565,7 @@ async function apiRoute(req, res, urlPath) {
     if (!full.buf || !full.buf.length) {
       return { ok: false, error: 'ទាញយកបទចម្រៀងមិនបាន · Could not download the song audio' };
     }
-    return mvLyricsTranscribeChunked(full.buf, mvLyricsFileName(full.contentType, audioUrl), full.contentType);
+    return mvLyricsTranscribeChunked(full.buf, mvLyricsFileName(full.contentType, audioUrl), full.contentType, lang);
   }
   if (req.method === 'POST' && urlPath === '/api/mv/lyrics') {
     readJSONBody(req, 64 * 1024).then(async (body) => {
@@ -14550,6 +14576,11 @@ async function apiRoute(req, res, urlPath) {
       await logActivity({ at: new Date().toISOString(), mode: 'mv-lyrics' });
       const audioUrl = body && typeof body.audioUrl === 'string' ? body.audioUrl.trim() : '';
       const translateTo = body && typeof body.translateTo === 'string' ? body.translateTo.trim().slice(0, 50) : '';
+      // Khmer fix: the client sends language 'km' when the song is Khmer
+      // so Whisper transcribes Khmer instead of guessing (and mixing in
+      // English words). Empty/invalid = auto-detect as before.
+      const langReq = body && typeof body.language === 'string' ? body.language.trim().toLowerCase() : '';
+      const lang = /^[a-z]{2,3}$/.test(langReq) ? langReq : '';
       let u;
       try { u = new URL(audioUrl); } catch (e) { u = null; }
       if (!u || (u.protocol !== 'http:' && u.protocol !== 'https:') || audioUrl.length > 2000) {
@@ -14559,7 +14590,7 @@ async function apiRoute(req, res, urlPath) {
       // see mvLyricsTranscribeSong). Throws only for Whisper/no-key.
       let tr;
       try {
-        tr = await mvLyricsTranscribeSong(audioUrl);
+        tr = await mvLyricsTranscribeSong(audioUrl, lang);
       } catch (e) {
         if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Groq API Key ទេ · Admin has not set a Groq API Key yet' });
         return sendJSON(res, 200, { ok: false, error: 'ស្ដាប់បទចម្រៀងមិនបាន (Whisper) · Could not transcribe the song (Whisper)' });
@@ -14589,7 +14620,7 @@ async function apiRoute(req, res, urlPath) {
       if (!translated) {
         return sendJSON(res, 200, { ok: true, language, lyrics: tr.lyrics, translationFailed: true });
       }
-      const outLyrics = tr.lyrics.map((l, i) => ({ text: (translated[i] !== undefined ? translated[i] : l.text), start: l.start, end: l.end }));
+      const outLyrics = tr.lyrics.map((l, i) => ({ text: (translated[i] !== undefined ? translated[i] : l.text), start: l.start, end: l.end, ...(l.words ? { words: l.words } : {}) }));
       return sendJSON(res, 200, { ok: true, language, translatedTo: translateTo, lyrics: outLyrics });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
