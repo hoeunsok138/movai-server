@@ -902,6 +902,18 @@ function trackKnownDevice(u, model, device, ip, now, country, countryCode) {
 // user record + the knownDevices entry for that IP in the background; on
 // failure (rate-limited, unreachable) both stay '' and the sync still
 // succeeds. No dependency.
+// IANA timezone -> country code (compact table for the VPN timezone
+// check). Only zones the server has seen / common VPN exits + the region.
+// Unknown zones return '' (no signal) — never a false flag.
+const TZ_COUNTRY = { 'Asia/Phnom_Penh': 'KH', 'Asia/Bangkok': 'TH', 'Asia/Ho_Chi_Minh': 'VN', 'Asia/Saigon': 'VN', 'Asia/Singapore': 'SG', 'Asia/Kuala_Lumpur': 'MY', 'Asia/Kuching': 'MY', 'Asia/Jakarta': 'ID', 'Asia/Manila': 'PH', 'Asia/Shanghai': 'CN', 'Asia/Chongqing': 'CN', 'Asia/Hong_Kong': 'HK', 'Asia/Taipei': 'TW', 'Asia/Tokyo': 'JP', 'Asia/Seoul': 'KR', 'Asia/Kolkata': 'IN', 'Asia/Karachi': 'PK', 'Asia/Dhaka': 'BD', 'Asia/Yangon': 'MM', 'Asia/Dubai': 'AE', 'Asia/Riyadh': 'SA', 'Asia/Tehran': 'IR', 'Asia/Almaty': 'KZ', 'Asia/Tashkent': 'UZ', 'Europe/London': 'GB', 'Europe/Paris': 'FR', 'Europe/Berlin': 'DE', 'Europe/Madrid': 'ES', 'Europe/Rome': 'IT', 'Europe/Amsterdam': 'NL', 'Europe/Brussels': 'BE', 'Europe/Vienna': 'AT', 'Europe/Stockholm': 'SE', 'Europe/Oslo': 'NO', 'Europe/Helsinki': 'FI', 'Europe/Warsaw': 'PL', 'Europe/Moscow': 'RU', 'Europe/Istanbul': 'TR', 'Europe/Athens': 'GR', 'Europe/Kiev': 'UA', 'Africa/Cairo': 'EG', 'Africa/Lagos': 'NG', 'Africa/Johannesburg': 'ZA', 'America/New_York': 'US', 'America/Chicago': 'US', 'America/Denver': 'US', 'America/Los_Angeles': 'US', 'America/Toronto': 'CA', 'America/Vancouver': 'CA', 'America/Mexico_City': 'MX', 'America/Sao_Paulo': 'BR', 'America/Argentina/Buenos_Aires': 'AR', 'America/Lima': 'PE', 'America/Bogota': 'CO', 'Australia/Sydney': 'AU', 'Australia/Melbourne': 'AU', 'Pacific/Auckland': 'NZ' };
+function tzCountry(tz) { if (typeof tz !== 'string') return ''; return TZ_COUNTRY[tz.trim()] || ''; }
+// Datacenter / hosting / cloud org names (from the free ipapi.co `org`
+// field). An IP whose org is a cloud/hosting provider is almost certainly
+// a VPN, proxy or datacenter exit — a normal Cambodian mobile/broadband
+// IP shows a telecom org (Metfone, Smart, Cellcard, EZECOM...). Matched
+// case-insensitively, substring. Flag only — never a block.
+const VPN_DATACENTER_ORGS = ['digitalocean', 'vultr', 'linode', 'ovh', 'hetzner', 'amazon', 'aws', 'google cloud', 'google llc', 'cloudflare', 'microsoft', 'azure', 'alibaba', 'oracle cloud', 'kamatera', 'choopa', 'm247', 'datacamp', 'leaseweb', 'servers.com', 'packet', 'vps', 'hosting', 'datacenter', 'colocation', 'colo', 'dedicated'];
+function isDatacenterOrg(org) { const o = String(org || '').toLowerCase(); if (!o) return false; return VPN_DATACENTER_ORGS.some((k) => o.indexOf(k) !== -1); }
 async function lookupIpCountryAsync(email, ip) {
   if (!email || !ip) return;
   (async () => {
@@ -910,23 +922,30 @@ async function lookupIpCountryAsync(email, ip) {
       const j = r.ok ? await r.json().catch(() => null) : null;
       const country = j && typeof j.country_name === 'string' ? j.country_name.trim().slice(0, 100) : '';
       const countryCode = j && typeof j.country_code === 'string' ? j.country_code.trim().toUpperCase().slice(0, 8) : '';
-      if (!country && !countryCode) return;
+      const ipOrg = j && typeof j.org === 'string' ? j.org.trim().slice(0, 100) : '';
+      if (!country && !countryCode && !ipOrg) return;
       const users = await loadUsers();
       const u = users[email];
       if (!u) return;
-      // VPN flag (country change for the DEVICE): if this device was
-      // previously seen in a DIFFERENT country, the IP's country
-      // changed — likely VPN (or travel). The fingerprint still
-      // identifies the device; the flag is informational only.
+      // VPN flags for the DEVICE (informational only — never a block):
+      // (a) country changed for this known device — likely VPN (or
+      // travel); (b) the IP org is a datacenter/hosting/cloud provider
+      // (VPN/proxy exit); (c) the device timezone's country differs from
+      // the IP country. The fingerprint still identifies the device.
       try {
         const did = u.lastDeviceId || u.deviceId || '';
-        if (did && country) {
+        if (did && (country || countryCode || ipOrg)) {
           const dall = await loadDeviceRecords();
           const dk = 'id:' + did;
           const dr = dall[dk];
           if (dr && typeof dr === 'object') {
-            if (dr.country && dr.country !== country) { dr.vpnDetected = true; dr.vpnLastSeen = new Date().toISOString(); }
-            if (dr.country !== country) { dr.country = country; await saveDeviceRecords(dall); }
+            if (dr.country && country && dr.country !== country) { dr.vpnDetected = true; dr.vpnLastSeen = new Date().toISOString(); }
+            if (isDatacenterOrg(ipOrg)) { dr.vpnDetected = true; dr.vpnLastSeen = new Date().toISOString(); }
+            const _tzc = tzCountry(dr.timezone || '');
+            if (_tzc && countryCode && _tzc !== countryCode) { dr.vpnDetected = true; dr.vpnLastSeen = new Date().toISOString(); }
+            if (ipOrg) dr.ipOrg = ipOrg;
+            if (country && dr.country !== country) { dr.country = country; await saveDeviceRecords(dall); }
+            else if (ipOrg || dr.vpnDetected) { await saveDeviceRecords(dall); }
           }
         }
       } catch (e) {}
@@ -2178,14 +2197,20 @@ const SETTINGS_DEFAULTS = {
   // L3 = max-2 (min 1), L4 = 1. Block minutes stay 5/20/60/720.
   // Default 4, valid 1-10; invalid stored values fall back to 4.
   maxLoginAttempts: 4,
-  // Device account-limit toggle (owner order 2026-11-18). deviceLimitEnabled
-  // (default OFF) = enforce the free-account limit at registration;
-  // deviceLimit (default 3) = how many free Google accounts one device
-  // may register. The Admin can change the number later (e.g. 5+ when
-  // the website is profitable). Read fresh from disk on every
-  // registration — an Admin change takes effect immediately.
-  deviceLimitEnabled: false,
-  deviceLimit: 3,
+  // Device account-limit (owner order 2026-11-25, refined from
+  // 2026-11-18: free 2 (was 3), enforcement ON by default (was OFF),
+  // max 10 accounts per device, $0.99 per extra slot). deviceLimitEnabled
+  // (default ON) = enforce the free-account limit at registration;
+  // deviceLimit (default 2) = how many free Google accounts one device
+  // may register. deviceSlotPrice (default 0.99) = price per extra
+  // account slot. deviceMaxAccounts (default 10) = hard cap on accounts
+  // per device (free + purchased slots never exceed it). The Admin can
+  // change all four later. Read fresh from disk on every registration
+  // — an Admin change takes effect immediately.
+  deviceLimitEnabled: true,
+  deviceLimit: 2,
+  deviceSlotPrice: 0.99,
+  deviceMaxAccounts: 10,
   // New-user gift-50 toggle (owner order 2026-11-18). When true, a
   // BRAND-NEW registrant who claims the gift gets 50 song credits
   // instead of 24. When false (default) the gift is 24 song credits.
@@ -2282,11 +2307,22 @@ function cleanSettings(j, base) {
   // the stored value — the default 4 when loading fresh. The Admin
   // input enforces min 1 / max 10.
   if (Number.isFinite(j.maxLoginAttempts)) { const _m = Math.floor(j.maxLoginAttempts); if (_m >= 1 && _m <= 10) s.maxLoginAttempts = _m; }
-  // Device account-limit toggle (owner order 2026-11-18). enabled is a
-  // boolean; limit is a whole number 1-100 (default 3). Invalid values
-  // keep the stored value.
+  // Device account-limit (owner order 2026-11-25). enabled is a boolean;
+  // limit is a whole number 1-10 (default 2); slotPrice is $0.01-100
+  // (default 0.99); maxAccounts is a whole number 2-10 (default 10).
+  // Invalid values keep the stored value.
   if (typeof j.deviceLimitEnabled === 'boolean') s.deviceLimitEnabled = j.deviceLimitEnabled;
-  if (Number.isFinite(j.deviceLimit)) s.deviceLimit = Math.min(100, Math.max(1, Math.floor(j.deviceLimit)));
+  if (Number.isFinite(j.deviceLimit)) { const _dl = Math.floor(j.deviceLimit); if (_dl >= 1 && _dl <= 10) s.deviceLimit = _dl; }
+  if (Number.isFinite(j.deviceSlotPrice) && j.deviceSlotPrice >= 0.01 && j.deviceSlotPrice <= 100) s.deviceSlotPrice = Math.round(j.deviceSlotPrice * 100) / 100;
+  if (Number.isFinite(j.deviceMaxAccounts)) { const _ma = Math.floor(j.deviceMaxAccounts); if (_ma >= 2 && _ma <= 10) s.deviceMaxAccounts = _ma; }
+  // ONE-TIME migration (owner order 2026-11-25): the old defaults were
+  // OFF / 3. A stored doc that still has exactly the old defaults AND
+  // none of the new keys has never been deliberately changed (the Admin
+  // UI never had a number input for the limit, only the toggle) — apply
+  // the new defaults (ON / 2). Any other stored value, and any doc saved
+  // after this change (it always carries the new keys), is honoured
+  // as-is, including a deliberate OFF / 3 set by the Admin later.
+  if (!('deviceSlotPrice' in j) && !('deviceMaxAccounts' in j) && j.deviceLimitEnabled === false && j.deviceLimit === 3) { s.deviceLimitEnabled = true; s.deviceLimit = 2; }
   // Gift-50 toggle (owner order 2026-11-18). Boolean; invalid values
   // keep the stored value (default OFF).
   if (typeof j.gift50 === 'boolean') s.gift50 = j.gift50;
@@ -3177,16 +3213,17 @@ async function monetizationOnView(ownerEmail, viewerEmail, country, durationSec)
 }
 // ---- Device account limit + VPN-proof fingerprint (owner order 2026-11-18) ----
 // Anti-abuse: one person can own 10 Gmails on one phone and register 10
-// MovAi accounts to claim 10 gifts / create many songs. Rule: max 3
-// accounts per DEVICE, free. A 4th+ registration is refused; each extra
-// Gmail costs $1.00 (paid from the Wallet). Login is UNLIMITED — the
-// limit is only on REGISTERING new accounts.
+// MovAi accounts to claim 10 gifts / create many songs. Rule: max 2
+// accounts per DEVICE, free (owner order 2026-11-25; was 3). A 3rd+
+// registration is refused; each extra Gmail costs $0.99 (paid from the
+// Wallet), up to 10 accounts per device. Login is UNLIMITED — the limit
+// is only on REGISTERING new accounts.
 // The fingerprint must survive VPN: it does NOT rely on IP alone. The
 // primary identifier is a stable client device ID (a UUID the website
 // generates once and keeps in localStorage) + phone model + user-agent +
 // screen. Turning on VPN only changes the IP — the device is still
-// recognised, so VPN cannot evade the 3-account limit. A brand-new
-// device (no prior registrations) is allowed its 3 accounts. A new or
+// recognised, so VPN cannot evade the 2-account limit. A brand-new
+// device (no prior registrations) is allowed its 2 accounts. A new or
 // different phone model alone NEVER blocks a legitimate user — the model
 // is only part of the fingerprint.
 // Graduated warnings (owner order 2026-11-18, replaces immediate block):
@@ -3198,11 +3235,12 @@ async function monetizationOnView(ownerEmail, viewerEmail, country, durationSec)
 //   strike 4+ (BLOCK) — the DEVICE is blocked + the attempting Gmail is
 //                        blocked; email tells them to check their phone —
 //                        it has a scam or a hidden hacker in it.
-// Buying extra slots ($1 each) resets the device's strikes to 0 (they
+// Buying extra slots ($0.99 each) resets the device's strikes to 0 (they
 // paid, so they are compliant again). The Admin unblocks a device via
 // POST /api/admin/unblock-device (and a Gmail via unblock-email).
-const DEVICE_FREE_ACCOUNT_LIMIT = 3; // free accounts per device
-const DEVICE_SLOT_PRICE = 1.00; // $1.00 per extra account slot (Gmail)
+const DEVICE_FREE_ACCOUNT_LIMIT = 2; // free accounts per device (owner order 2026-11-25; was 3)
+const DEVICE_SLOT_PRICE_DEFAULT = 0.99; // $0.99 per extra account slot (Gmail) (owner order 2026-11-25; was $1.00)
+const DEVICE_MAX_ACCOUNTS_DEFAULT = 10; // hard cap: at most 10 Gmail accounts per device (owner order 2026-11-25)
 const DEVICE_STRIKE_BLOCK_AT = 4; // block the device at strike 4
 // Auto-Catch master toggle (owner order 2026-11-18). Stored in settings
 // (GitHub-backed, default OFF). When OFF the server still RECORDS
@@ -3224,9 +3262,10 @@ async function autoCatchEnabled() {
 async function lockoutEnabled() {
   try { const s = await loadSettings(); return s && s.lockoutEnabled !== false; } catch (e) { return true; }
 }
-// Device account-limit setting (owner order 2026-11-18). Stored in
-// settings (GitHub-backed). deviceLimitEnabled (default OFF) = enforce
-// the free-account limit at registration; deviceLimit (default 3) =
+// Device account-limit setting (owner order 2026-11-18, refined
+// 2026-11-25: default ON, free 2). Stored in settings (GitHub-backed).
+// deviceLimitEnabled (default ON) = enforce the free-account limit at
+// registration; deviceLimit (default 2) =
 // how many free Google accounts one device may register. Read FRESH
 // from disk on EVERY call (loadSettings re-reads settings.json — no
 // in-memory cache) so an Admin change takes effect immediately on the
@@ -3237,9 +3276,13 @@ async function deviceLimitSetting() {
     const s = await loadSettings();
     const enabled = !!(s && s.deviceLimitEnabled === true);
     let limit = DEVICE_FREE_ACCOUNT_LIMIT;
-    if (s && Number.isFinite(s.deviceLimit)) limit = Math.min(100, Math.max(1, Math.floor(s.deviceLimit)));
-    return { enabled, limit };
-  } catch (e) { return { enabled: false, limit: DEVICE_FREE_ACCOUNT_LIMIT }; }
+    if (s && Number.isFinite(s.deviceLimit)) { const _l = Math.floor(s.deviceLimit); if (_l >= 1 && _l <= 10) limit = _l; }
+    let slotPrice = DEVICE_SLOT_PRICE_DEFAULT;
+    if (s && Number.isFinite(s.deviceSlotPrice) && s.deviceSlotPrice >= 0.01 && s.deviceSlotPrice <= 100) slotPrice = Math.round(s.deviceSlotPrice * 100) / 100;
+    let maxAccounts = DEVICE_MAX_ACCOUNTS_DEFAULT;
+    if (s && Number.isFinite(s.deviceMaxAccounts)) { const _m = Math.floor(s.deviceMaxAccounts); if (_m >= 2 && _m <= 10) maxAccounts = _m; }
+    return { enabled, limit, slotPrice, maxAccounts };
+  } catch (e) { return { enabled: true, limit: DEVICE_FREE_ACCOUNT_LIMIT, slotPrice: DEVICE_SLOT_PRICE_DEFAULT, maxAccounts: DEVICE_MAX_ACCOUNTS_DEFAULT }; }
 }
 // New-user gift-50 toggle (owner order 2026-11-18). Stored in settings
 // (GitHub-backed). When ON, a BRAND-NEW registrant who claims the gift
@@ -3346,7 +3389,7 @@ async function deviceSlotsFor(fp) {
 }
 // Is this device blocked? Canonical key only (precise): a cleared
 // localStorage (new deviceId) cannot be matched to the old record, but
-// the registration limit (model+IP count) still catches a 4th account.
+// the registration limit (model+IP count) still catches a 3rd account.
 async function deviceIsBlocked(fp) {
   const got = await getDeviceRecord(fp, false);
   const rec = got.rec;
@@ -3372,13 +3415,16 @@ function deviceAccountsCount(users, fp) {
   }
   return n;
 }
-// VPN detection (owner order 2026-11-18): VPN does NOT hide the device.
-// Signals: (1) the website explicitly reports vpn:true; (2) the IP's
-// country changes for a recognised device (checked in the async country
-// lookup below). An IP change alone only bumps ipChanges — it is a
-// neutral signal (WiFi -> mobile data also changes the IP), never a
-// block by itself. The block comes only from the 3-account limit +
-// strikes.
+// VPN detection (owner order 2026-11-18, strengthened 2026-11-25): VPN
+// does NOT hide the device. Signals: (1) the website explicitly reports
+// vpn:true; (2) the IP's country changes for a recognised device; (3) the
+// IP's org (ipapi.co) is a datacenter / hosting / cloud provider; (4) the
+// device timezone's country differs from the IP country. (3) and (4) are
+// checked in the async country lookup below. An IP change alone only bumps
+// ipChanges — it is a neutral signal (WiFi -> mobile data also changes
+// the IP), never a block by itself. A VPN flag NEVER blocks anything —
+// it is only an indicator for the Admin. The block comes only from the
+// device-account limit + strikes.
 function deviceNoteVpn(rec, fp, now) {
   if (!rec) return;
   if (fp.vpn && !rec.vpnDetected) { rec.vpnDetected = true; rec.vpnLastSeen = now; }
@@ -3428,7 +3474,8 @@ async function deviceInfoForUser(users, u) {
     if (r.vpnLastSeen && (!vpnLastSeen || r.vpnLastSeen > vpnLastSeen)) vpnLastSeen = r.vpnLastSeen;
     if (r.blocked) { deviceBlocked = true; blockedReason = r.blockedReason || 'device-blocked'; }
   }
-  return { fingerprint: ck, accounts, slots, limit: (await deviceLimitSetting()).limit + slots, strikes, vpnDetected, vpnSuspected: vpnDetected, vpnLastSeen, deviceBlocked, blockedReason, emailBlocked: (await loadBlockedEmails()).some((b) => b === (u.email || '')) };
+  const _dl = await deviceLimitSetting();
+  return { fingerprint: ck, accounts, slots, limit: Math.min(_dl.limit + slots, _dl.maxAccounts), strikes, vpnDetected, vpnSuspected: vpnDetected, vpnLastSeen, deviceBlocked, blockedReason, emailBlocked: (await loadBlockedEmails()).some((b) => b === (u.email || '')) };
 }
 // Strike / block emails — APPROVED DESIGN (owner order 2026-11-18).
 // Matches the approved Strike 1 preview (strike-1-warning-email-preview):
@@ -3490,14 +3537,14 @@ function deviceStrikeEmail(level, reason, ctx) {
   // Shared content — copied from the approved preview (same for all levels).
   const BAN_KM = [
     { t: 'ហាមបើក VPN', s: 'ដើម្បីបិទបាំង Device ឬប្ដូរ IP ក្លែងធ្វើជាទូរស័ព្ទថ្មី ដើម្បីចុះឈ្មោះបន្ថែម។ ប្រព័ន្ធសម្គាល់ Device បានដោយផ្ទាល់ — VPN លាក់មិនបានទេ ហើយ VPN ក៏មិនត្រូវបានគាំទ្រ (Not Supported) សម្រាប់ការចុះឈ្មោះដែរ។' },
-    { t: 'ហាមចុះឈ្មោះលើសពី 3 គណនី', s: 'នៅក្នុងទូរស័ព្ទតែមួយ (1 Device = 3 Accounts)។ បើចង់ប្រើ Gmail បន្ថែម ត្រូវ Upgrade — បន្ថែម 1 Gmail = $1 បង់តាម Balance ក្នុង Profile។' },
+    { t: 'ហាមចុះឈ្មោះលើសពី 2 គណនី', s: 'នៅក្នុងទូរស័ព្ទតែមួយ (1 Device = 2 Accounts)។ បើចង់ប្រើ Gmail បន្ថែម ត្រូវ Upgrade — បន្ថែម 1 Gmail = $0.99 បង់តាម Balance ក្នុង Profile (ច្រើនបំផុត 10 គណនី)។' },
     { t: 'ហាមទុក App ស្កេម ឬ App ដែលមិនស្គាល់ប្រភព', s: 'នៅក្នុងទូរស័ព្ទ ជាពិសេស App ដែលទាញយកក្រៅ Play Store / App Store។ App បែបនេះអាចលួចមើលអេក្រង់ អានសារ OTP និងលួចលុយពីគណនីធនាគាររបស់អ្នកបាន។' },
     { t: 'ហាមឲ្យលេខកូដ OTP ឬ Password', s: 'ទៅអ្នកដទៃ ទោះគេអះអាងថាជាបុគ្គលិក MovAi ឬបុគ្គលិកធនាគារក៏ដោយ។ ក្រុម MovAi មិនដែលសុំលេខកូដ OTP ឬ Password របស់អ្នកទេ។' },
     { t: 'ហាមប្រើ MovAi ក្លែងបន្លំ (MOD / Crack)', s: 'ឬចូលតាម Website ក្លែងក្លាយ។ សូមប្រើតែ Website ផ្លូវការរបស់ MovAi ប៉ុណ្ណោះ។' },
   ];
   const BAN_EN = [
     { t: 'Do not use a VPN', s: 'to hide your device or change your IP to look like a new phone and register more accounts. Our system identifies the device directly — a VPN cannot hide it, and VPNs are not supported for registration.' },
-    { t: 'Do not register more than 3 accounts', s: 'on one phone (1 device = 3 accounts). If you need more Gmail accounts, please Upgrade — each extra Gmail is $1, paid from your Profile balance.' },
+    { t: 'Do not register more than 2 accounts', s: 'on one phone (1 device = 2 accounts). If you need more Gmail accounts, please Upgrade — each extra Gmail is $0.99, paid from your Profile balance (up to 10 accounts).' },
     { t: 'Do not keep scam apps or apps from unknown sources', s: 'on your phone, especially apps installed from outside the Play Store / App Store. Such apps can watch your screen, read OTP codes, and steal money from your bank account.' },
     { t: 'Never give your OTP code or password', s: 'to anyone, even if they claim to be MovAi staff or bank staff. MovAi never asks for your OTP code or password.' },
     { t: 'Do not use fake MovAi copies (MOD / Crack)', s: 'or fake websites. Only use the official MovAi website.' },
@@ -3703,15 +3750,19 @@ async function recordDeviceStrike(all, key, rec, email, reason, fp, extra) {
 // Device-limit gate for NEW account creation. Returns null when the
 // registration may proceed, or the error payload when it must be refused.
 // The limit is enforced ONLY when deviceLimitEnabled is ON (owner order
-// 2026-11-18 — default OFF, because the website is not working well
-// yet); the setting is read fresh from disk on EVERY call, so an Admin
-// change takes effect immediately. When ON, the free limit is the
-// configured deviceLimit (default 3) + purchased slots. A standing
-// block (strike 4 while Auto-Catch was ON) is still enforced even
-// when the toggle is OFF — only the Admin lifts it (unblock-device).
-// On refusal it records a strike (+ level email and block at strike 4
-// only when Auto-Catch is ON). The refusal itself is the limit
-// enforcement, so it applies whenever the limit toggle is ON.
+// 2026-11-25 — default ON, free 2, max 10 accounts per device, $0.99
+// per extra slot); the setting is read fresh from disk on EVERY call,
+// so an Admin change takes effect immediately. The effective limit is
+// min(free limit + purchased slots, maxAccounts). A standing block
+// (strike 4 while Auto-Catch was ON) is still enforced even when the
+// toggle is OFF — only the Admin lifts it (unblock-device). On refusal
+// it records a strike (+ level email and block at strike 4 only when
+// Auto-Catch is ON). The refusal itself is the limit enforcement, so it
+// applies whenever the limit toggle is ON. The gate runs ONLY for
+// brand-new registrations — an existing account re-logging in is never
+// gated, so a device that already has MORE than the free limit
+// (grandfathered) keeps its accounts; only NEW Gmails beyond the max
+// are refused.
 async function deviceLimitGate(users, fp, email, name) {
   const count = deviceAccountsCount(users, fp);
   const got = await getDeviceRecord(fp, true);
@@ -3720,10 +3771,12 @@ async function deviceLimitGate(users, fp, email, name) {
   const slots = Math.floor(numOr(rec.slots, 0));
   const dl = await deviceLimitSetting(); // fresh from settings, every call
   const freeLimit = dl.limit;
-  const limit = freeLimit + slots;
+  const slotPrice = dl.slotPrice;
+  const maxAccounts = dl.maxAccounts;
+  const limit = Math.min(freeLimit + slots, maxAccounts);
   // A blocked device cannot register at all.
   if (rec.blocked) {
-    return { ok: false, error: 'ឧបករណ៍នេះត្រូវបានប្លុក — This device has been used before · VPN is not supported. សូមទាក់ទង Admin · Please contact the Admin', deviceBlocked: true, blockedReason: rec.blockedReason || 'device-blocked', deviceLimitReached: true, upgradePrice: DEVICE_SLOT_PRICE, deviceLimit: freeLimit, deviceAccounts: count, deviceSlots: slots };
+    return { ok: false, error: 'ឧបករណ៍នេះត្រូវបានប្លុក — This device has been used before · VPN is not supported. សូមទាក់ទង Admin · Please contact the Admin', deviceBlocked: true, blockedReason: rec.blockedReason || 'device-blocked', deviceLimitReached: true, upgradePrice: slotPrice, deviceLimit: freeLimit, deviceAccounts: count, deviceSlots: slots, maxAccounts: maxAccounts };
   }
   // Device-limit toggle OFF: no limit enforcement at registration —
   // users can register many accounts.
@@ -3733,7 +3786,7 @@ async function deviceLimitGate(users, fp, email, name) {
   // block at 4 only when Auto-Catch is ON).
   const reason = (fp.vpn || rec.vpnDetected) ? 'vpn' : 'device-limit';
   const st = await recordDeviceStrike(all, got.key, rec, email, reason, fp, { name: name || '', count, limit: freeLimit });
-  return { ok: false, error: 'ឧបករណ៍នេះត្រូវបានប្រើរួចហើយ — This device has been used before · VPN is not supported. ឧបករណ៍នេះបានចុះឈ្មោះគណនី ' + count + ' រួចហើយ (កំណត់ ' + freeLimit + ' ដោយឥតគិតថ្លៃ) — សូម Upgrade 1 Gmail = $' + DEVICE_SLOT_PRICE.toFixed(2) + ' · This device already registered ' + count + ' accounts (max ' + freeLimit + ' free) — please Upgrade, 1 Gmail = $' + DEVICE_SLOT_PRICE.toFixed(2), deviceLimitReached: true, upgradePrice: DEVICE_SLOT_PRICE, deviceLimit: freeLimit, deviceAccounts: count, deviceSlots: slots, strike: st.strikes, deviceBlocked: st.blocked };
+  return { ok: false, code: 'device_limit_reached', error: 'ឧបករណ៍នេះបានចុះឈ្មោះ Gmail ' + count + ' រួចហើយ (ឥតគិតថ្លៃបាន ' + freeLimit + ' គណនី) — ចុច Upgrade ដើម្បីបន្ថែម 1 Gmail = $' + slotPrice.toFixed(2) + ' (ច្រើនបំផុត ' + maxAccounts + ' គណនី) · This device already has ' + count + ' Gmail accounts (max ' + freeLimit + ' free) — tap Upgrade to add 1 Gmail = $' + slotPrice.toFixed(2) + ' (up to ' + maxAccounts + ' accounts)', deviceLimitReached: true, upgradePrice: slotPrice, deviceLimit: freeLimit, deviceAccounts: count, deviceSlots: slots, maxAccounts: maxAccounts, strike: st.strikes, deviceBlocked: st.blocked };
 }
 // Scam / hacker detection — NOTIFY ONLY, never block (owner order
 // 2026-11-18). When the system detects a scam or a hidden hacker, it
@@ -9812,9 +9865,9 @@ async function apiRoute(req, res, urlPath) {
       const users = await loadUsers();
       const isNewUser = !users[email];
       let u = users[email];
-      // DEVICE ACCOUNT LIMIT (owner order 2026-11-18): max N accounts per
-      // DEVICE, free (N = deviceLimit setting, default 3 — enforced only
-      // when deviceLimitEnabled is ON). A 4th+ registration is refused
+      // DEVICE ACCOUNT LIMIT (owner order 2026-11-25): max N accounts per
+      // DEVICE, free (N = deviceLimit setting, default 2 — enforced only
+      // when deviceLimitEnabled is ON). A 3rd+ registration is refused
       // (strike + level email when Auto-Catch is ON, device blocked at
       // strike 4). Login is unlimited — the limit is only on
       // REGISTERING new accounts.
@@ -9977,7 +10030,15 @@ async function apiRoute(req, res, urlPath) {
       if (_isNewDevice) {
         await addNotification('security', email, '🔐 ឧបករណ៍ថ្មី · New device login', email + ' logged in from a new device: ' + (_model || _dev || 'Unknown') + ' · IP ' + (_cip || '—'));
       }
-      return sendJSON(res, 200, { ok: true, user: await pubUser(u, _modelLogins) });
+      // Device-limit picture for THIS device (the website's Upgrade pane
+      // shows accounts / limit / slots + the slot price, so the user can
+      // buy more Gmail slots before hitting the limit). Additive only.
+      const _devDl = await deviceLimitSetting();
+      const _devRec = await getDeviceRecord(_fp, false);
+      const _devSlots = Math.floor(numOr(_devRec.rec && _devRec.rec.slots, 0));
+      const _devAccounts = deviceAccountsCount(users, _fp);
+      const _devLimit = Math.min(_devDl.limit + _devSlots, _devDl.maxAccounts);
+      return sendJSON(res, 200, { ok: true, user: await pubUser(u, _modelLogins), device: { accounts: _devAccounts, slots: _devSlots, limit: _devLimit, freeLimit: _devDl.limit, maxAccounts: _devDl.maxAccounts, slotPrice: _devDl.slotPrice, limitReached: _devAccounts >= _devLimit } });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
@@ -10567,16 +10628,17 @@ async function apiRoute(req, res, urlPath) {
     return;
   }
   // GET /api/admin/device-limit — admin key required. Reads the device
-  // account-limit setting {enabled, limit} (defaults OFF / 3).
-  // POST /api/admin/device-limit {enabled?, limit?} sets it. The limit
-  // is read fresh from settings on EVERY registration, so a change
-  // takes effect immediately. The Admin app has a toggle + number
-  // input for it.
+  // account-limit setting {enabled, limit, slotPrice, maxAccounts}
+  // (defaults ON / 2 / $0.99 / 10 — owner order 2026-11-25).
+  // POST /api/admin/device-limit {enabled?, limit?, slotPrice?,
+  // maxAccounts?} sets any of them. The limit is read fresh from
+  // settings on EVERY registration, so a change takes effect
+  // immediately. The Admin app has a toggle + number inputs for it.
   if (req.method === 'GET' && urlPath === '/api/admin/device-limit') {
     const a = await adminKeyOk(req);
     if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
     const dl = await deviceLimitSetting();
-    return sendJSON(res, 200, { ok: true, enabled: dl.enabled, limit: dl.limit });
+    return sendJSON(res, 200, { ok: true, enabled: dl.enabled, limit: dl.limit, slotPrice: dl.slotPrice, maxAccounts: dl.maxAccounts });
   }
   if (req.method === 'POST' && urlPath === '/api/admin/device-limit') {
     const a = await adminKeyOk(req);
@@ -10584,11 +10646,42 @@ async function apiRoute(req, res, urlPath) {
     readJSONBody(req, 64 * 1024).then(async (body) => {
       const patch = {};
       if (body && typeof body.enabled === 'boolean') patch.deviceLimitEnabled = body.enabled;
-      if (body && Number.isFinite(body.limit)) patch.deviceLimit = Math.min(100, Math.max(1, Math.floor(body.limit)));
-      if (!('deviceLimitEnabled' in patch) && !('deviceLimit' in patch)) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ enabled និង/ឬ limit (1–100)' });
+      if (body && Number.isFinite(body.limit)) patch.deviceLimit = Math.min(10, Math.max(1, Math.floor(body.limit)));
+      if (body && Number.isFinite(body.slotPrice) && body.slotPrice >= 0.01 && body.slotPrice <= 100) patch.deviceSlotPrice = Math.round(body.slotPrice * 100) / 100;
+      if (body && Number.isFinite(body.maxAccounts)) { const _ma = Math.floor(body.maxAccounts); if (_ma >= 2 && _ma <= 10) patch.deviceMaxAccounts = _ma; }
+      if (!('deviceLimitEnabled' in patch) && !('deviceLimit' in patch) && !('deviceSlotPrice' in patch) && !('deviceMaxAccounts' in patch)) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ enabled និង/ឬ limit (1–10) និង/ឬ slotPrice និង/ឬ maxAccounts (2–10)' });
       await saveSettings(Object.assign(await loadSettings(), patch));
       const dl = await deviceLimitSetting();
-      return sendJSON(res, 200, { ok: true, enabled: dl.enabled, limit: dl.limit });
+      return sendJSON(res, 200, { ok: true, enabled: dl.enabled, limit: dl.limit, slotPrice: dl.slotPrice, maxAccounts: dl.maxAccounts });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  // POST /api/admin/device-slots — {fingerprint, slots} — admin key
+  // required. Sets a device's PURCHASED extra account slots (absolute,
+  // 0..maxExtra = maxAccounts - freeLimit, default 0..8). No charge is
+  // made from Admin — the $0.99/slot price is reference only (users
+  // normally pay via wallet top-up + POST /api/public/device/buy-slot).
+  // Setting slots also resets the device's strikes to 0 (same as buying).
+  if (req.method === 'POST' && urlPath === '/api/admin/device-slots') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      const fp = body && typeof body.fingerprint === 'string' ? body.fingerprint.trim() : '';
+      if (!fp) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ fingerprint ឧបករណ៍ · Device fingerprint required' });
+      const dl = await deviceLimitSetting();
+      const maxExtra = Math.max(0, dl.maxAccounts - dl.limit);
+      const slots = Math.floor(numOr(body && body.slots, -1));
+      if (!Number.isFinite(slots) || slots < 0 || slots > maxExtra) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ចំនួន Slot 0–' + maxExtra + ' · Please enter 0–' + maxExtra + ' slots' });
+      const all = await loadDeviceRecords();
+      const rec = all[fp];
+      if (!rec || typeof rec !== 'object') return sendJSON(res, 200, { ok: false, error: 'រកឧបករណ៍នេះមិនឃើញទេ · Device not found' });
+      rec.slots = slots;
+      rec.strikes = 0;
+      rec.lastSeen = new Date().toISOString();
+      await saveDeviceRecords(all);
+      scheduleBackup('device-records.json');
+      const accounts = Array.isArray(rec.emails) ? rec.emails.length : 0;
+      return sendJSON(res, 200, { ok: true, fingerprint: fp, slots: slots, deviceLimit: Math.min(dl.limit + slots, dl.maxAccounts), deviceAccounts: accounts, maxAccounts: dl.maxAccounts });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
@@ -12697,18 +12790,24 @@ async function apiRoute(req, res, urlPath) {
     return;
   }
   // POST /api/public/device/buy-slot — {email, count} — PUBLIC (logged-in
-  // user). Buys extra account slots for THIS device: $1.00 per slot, paid
-  // from the user's Wallet balance. The slots raise the device's
-  // registration limit (3 free + purchased slots), so the device can
-  // register more Gmails. Buying slots resets the device's strikes to 0
-  // (they paid, so they are compliant again). A BLOCKED device cannot buy
-  // slots — the Admin must unblock it first (no money taken).
+  // user). Buys extra account slots for THIS device: $0.99 per slot
+  // (Admin setting deviceSlotPrice, default 0.99), paid from the user's
+  // Wallet balance. The wallet is topped up through the EXISTING
+  // KHQR/USDT receipt flow (POST /api/public/wallet/topup-request ->
+  // Admin approves -> balance += amount) — no new payment gateway. The
+  // slots raise the device's registration limit (free + purchased,
+  // capped at maxAccounts = 10), so the device can register more
+  // Gmails. Buying slots resets the device's strikes to 0 (they paid,
+  // so they are compliant again). A BLOCKED device cannot buy slots —
+  // the Admin must unblock it first (no money taken).
   if (req.method === 'POST' && urlPath === '/api/public/device/buy-slot') {
     readJSONBody(req, 64 * 1024).then(async (body) => {
       const email = normEmail(body && body.email);
       if (!email) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ Gmail ត្រឹមត្រូវ' });
       const count = Math.floor(numOr(body && body.count, 0));
-      if (count < 1 || count > 100) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ចំនួន Slot 1–100 · Please enter 1–100 slots' });
+      const _dl0 = await deviceLimitSetting();
+      const _maxExtra = Math.max(0, _dl0.maxAccounts - _dl0.limit);
+      if (count < 1 || count > _maxExtra) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ចំនួន Slot 1–' + _maxExtra + ' · Please enter 1–' + _maxExtra + ' slots' });
       const users = await loadUsers();
       const u = users[email];
       if (!u) return sendJSON(res, 200, { ok: false, error: 'រក Gmail នេះមិនឃើញទេ — សូម Sign-up ជាមុនសិន · No account with this Gmail, please sign up first' });
@@ -12719,7 +12818,9 @@ async function apiRoute(req, res, urlPath) {
       const rec = got.rec;
       if (!rec) return sendJSON(res, 200, { ok: false, error: 'មិនអាចកំណត់អត្តសញ្ញាណឧបករណ៍បានទេ · Cannot identify this device' });
       if (rec.blocked) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះត្រូវបានប្លុក — សូមទាក់ទង Admin ដើម្បីដោះប្លុកជាមុនសិន · This device is blocked — please contact the Admin to unblock first', deviceBlocked: true, blockedReason: rec.blockedReason || 'device-blocked' });
-      const price = walletMoney(count * DEVICE_SLOT_PRICE);
+      const _owned = Math.floor(numOr(rec.slots, 0));
+      if (_dl0.limit + _owned + count > _dl0.maxAccounts) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះមានគណនីច្រើនបំផុត ' + _dl0.maxAccounts + ' ហើយ — ទិញបន្ថែមមិនបានទេ · This device already reaches the maximum of ' + _dl0.maxAccounts + ' accounts', deviceLimit: Math.min(_dl0.limit + _owned, _dl0.maxAccounts), maxAccounts: _dl0.maxAccounts });
+      const price = walletMoney(count * _dl0.slotPrice);
       const bal = walletBalance(u);
       if (price > bal) return sendJSON(res, 200, { ok: false, error: 'លុយក្នុង Wallet មិនគ្រប់ទេ (ត្រូវការ $' + price.toFixed(2) + ' សម្រាប់ ' + count + ' Slot, នៅសល់ $' + bal.toFixed(2) + ') · Insufficient wallet balance (need $' + price.toFixed(2) + ' for ' + count + ' slots, have $' + bal.toFixed(2) + ')', balance: bal, price });
       const now = new Date().toISOString();
@@ -12742,7 +12843,8 @@ async function apiRoute(req, res, urlPath) {
       await saveDeviceRecords(got.all);
       scheduleBackup('users.json');
       scheduleBackup('device-records.json');
-      const deviceLimit = (await deviceLimitSetting()).limit + rec.slots;
+      const _dl1 = await deviceLimitSetting();
+      const deviceLimit = Math.min(_dl1.limit + rec.slots, _dl1.maxAccounts);
       await logActivity({ at: now, mode: 'device-buy-slot', email, count, price, slots: rec.slots, deviceLimit, deviceId: _fp.deviceId || '', model: _fp.model || '', ip: _fp.ip || '' });
       await addNotification('deduct', email, '➕ បានទិញ Slot អាខោន · Extra account slots bought', (u.name || email) + ' (' + email + ') បានទិញ ' + count + ' Slot ($' + price.toFixed(2) + ') សម្រាប់ឧបករណ៍ ' + (_fp.model || _fp.deviceId || 'Unknown') + ' — ឥឡូវចុះឈ្មោះបាន ' + deviceLimit + ' គណនី (នៅសល់ $' + u.balance.toFixed(2) + ')');
       return sendJSON(res, 200, { ok: true, slots: rec.slots, balance: u.balance, deviceLimit, price, count });
