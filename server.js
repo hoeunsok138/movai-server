@@ -4772,6 +4772,10 @@ function doseedoMapStems(job) {
   const seen = {};
   const addStem = (name, url) => {
     if (!name || !url || seen[name]) return;
+    // Doseedo also returns drum sub-stems (drum_substems_crash/hh/kick/...).
+    // A 6-stem split must show exactly the 6 main stems, so keep only the
+    // canonical stem names (vocals/music/drums/bass/guitar/piano/other).
+    if (SPLIT_STEM_ORDER.indexOf(name) < 0) return;
     seen[name] = true;
     stems.push({ name, url });
   };
