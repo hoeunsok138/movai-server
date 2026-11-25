@@ -66,17 +66,23 @@ const TYPES = {
 };
 
 /* ------------------------------- http helpers ------------------------------ */
-function sendJSON(res, code, obj) {
+function sendJSON(res, code, obj, opts) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, {
+  // API v2: opts.noCors omits the CORS headers entirely — used for the
+  // three server-only POST endpoints (POST /api/v1/songs|images|videos),
+  // which a browser must never be able to call.
+  const headers = {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
+  };
+  if (!opts || !opts.noCors) {
     // CORS: the MovAi website and the MovAi Admin app are separate origins.
     // Without these headers the browser blocks every API call (preflight).
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-  });
+    headers['Access-Control-Allow-Origin'] = '*';
+    headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
+    headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS';
+  }
+  res.writeHead(code, headers);
   res.end(body);
 }
 function errBody(code, km, en) { return { error: code, message: { km, en } }; }
@@ -2564,12 +2570,18 @@ async function saveAdminKeys(k) {
 // images need an active paid API package (imageRequiresPackage flag).
 // Video stays Coming Soon: POST /api/v1/videos answers
 // {ok:false, error:'video_not_available_yet'} and generates nothing.
+// API package durations (owner 2026-11-25 15:52): $5/$10/$50 are 1 month
+// (30 days); $500 is 5 MONTHS (150 days, 102,000 credits); $1250 is
+// 12 MONTHS (365 days, 255,000 credits). Credits EXPIRE at the end of
+// the billing period — unused credits are CUT OFF, no rollover (see
+// apiKeyExpirePackageIfNeeded). months/durationDays are returned by
+// GET /api/public/api-packages so the client can show "5 months".
 const API_PACKAGES = [
-  { id: 'api-5', price: 5, credits: 600 },
-  { id: 'api-10', price: 10, credits: 1200 },
-  { id: 'api-50', price: 50, credits: 8000 },
-  { id: 'api-500', price: 500, credits: 102000 },
-  { id: 'api-1250', price: 1250, credits: 255000 },
+  { id: 'api-5', price: 5, credits: 600, months: 1, durationDays: 30 },
+  { id: 'api-10', price: 10, credits: 1200, months: 1, durationDays: 30 },
+  { id: 'api-50', price: 50, credits: 8000, months: 1, durationDays: 30 },
+  { id: 'api-500', price: 500, credits: 102000, months: 5, durationDays: 150 },
+  { id: 'api-1250', price: 1250, credits: 255000, months: 12, durationDays: 365 },
 ];
 const API_PACKAGE_IDS = API_PACKAGES.map((p) => p.id);
 function apiPackageById(id) {
@@ -2577,9 +2589,19 @@ function apiPackageById(id) {
   return API_PACKAGES.find((p) => p.id === s) || null;
 }
 function apiPackagesPublic() {
-  return API_PACKAGES.map((p) => ({ id: p.id, price: p.price, credits: p.credits, perMonth: true }));
+  return API_PACKAGES.map((p) => ({ id: p.id, price: p.price, credits: p.credits, months: p.months, durationDays: p.durationDays, perMonth: true }));
 }
-const DEFAULT_API_SETTINGS = { songCost: 12, imageCost: 0, videoCost: 50, videoPackagePrice: 0, imageRequiresPackage: true, freeImages: 4 };
+// Expiry of a package grant: creation/approval time + the package's own
+// duration (30 / 150 / 365 days) — never a fixed 30 days. Returns an
+// ISO string, or null for an unknown package id.
+function apiPackageExpiresAt(pkg, fromMs) {
+  const p = typeof pkg === 'string' ? apiPackageById(pkg) : pkg;
+  if (!p || typeof p !== 'object') return null;
+  const base = Number.isFinite(fromMs) ? fromMs : Date.now();
+  const days = Math.max(1, Math.floor(Number(p.durationDays) || 30));
+  return new Date(base + days * 86400000).toISOString();
+}
+const DEFAULT_API_SETTINGS = { songCost: 12, imageCost: 0, videoCost: 50, videoPackagePrice: 0, imageRequiresPackage: true, freeImages: 4, apiEnabled: true };
 function apiSettingsClean(j) {
   const v = (j && typeof j === 'object' && !Array.isArray(j)) ? j : {};
   const cost = (x, d) => { const n = Math.floor(numOr(x, d)); return Number.isFinite(n) && n >= 0 ? n : d; };
@@ -2590,6 +2612,10 @@ function apiSettingsClean(j) {
     videoPackagePrice: cost(v.videoPackagePrice, DEFAULT_API_SETTINGS.videoPackagePrice),
     imageRequiresPackage: v.imageRequiresPackage === undefined ? true : v.imageRequiresPackage === true,
     freeImages: cost(v.freeImages, DEFAULT_API_SETTINGS.freeImages),
+    // API v2 kill switch (owner 2026-11-25 15:53): default ON (true).
+    // When false, ALL /api/v1/* calls are rejected 503 'api_disabled'.
+    // Toggled by Admin via GET/POST /api/admin/api-settings.
+    apiEnabled: v.apiEnabled === undefined ? true : v.apiEnabled === true,
   };
 }
 function apiKeyPrefixOf(key) { return typeof key === 'string' ? key.slice(0, 8) : ''; }
@@ -2598,19 +2624,24 @@ function apiKeyMask(key) {
   return key.slice(0, 8) + '…' + key.slice(-4);
 }
 function apiNewKeyValue() { return 'movai_' + crypto.randomBytes(24).toString('hex'); }
-function apiKeyPublic(rec) {
+function apiKeyPublic(rec, ctx) {
   if (!rec || typeof rec !== 'object') return null;
   const u = (rec.usage && typeof rec.usage === 'object') ? rec.usage : {};
-  return { id: rec.id || '', key: apiKeyMask(rec.key || ''), keyPrefix: rec.keyPrefix || apiKeyPrefixOf(rec.key || ''), email: rec.email || '', name: rec.name || '', credits: Math.max(0, Math.floor(numOr(rec.credits, 0))), package: rec.package || '', packageExpiresAt: rec.packageExpiresAt || '', freeImagesLeft: Math.max(0, Math.floor(numOr(rec.freeImagesLeft, 0))), freeSongTestUsed: rec.freeSongTestUsed === true, createdAt: rec.createdAt || '', lastUsedAt: rec.lastUsedAt || '', revoked: rec.revoked === true, usage: { songs: Math.max(0, Math.floor(numOr(u.songs, 0))), images: Math.max(0, Math.floor(numOr(u.images, 0))), videos: Math.max(0, Math.floor(numOr(u.videos, 0))), calls: Math.max(0, Math.floor(numOr(u.calls, 0))) } };
+  const pkgExpired = apiKeyPackageExpired(rec);
+  return { id: rec.id || '', key: apiKeyMask(rec.key || ''), keyPrefix: rec.keyPrefix || apiKeyPrefixOf(rec.key || ''), email: rec.email || '', name: rec.name || '', expiresAt: rec.expiresAt || null, expiry: (typeof rec.expiry === 'string' && rec.expiry) ? rec.expiry : 'unlimited', status: apiKeyStatus(rec, ctx), credits: pkgExpired ? 0 : Math.max(0, Math.floor(numOr(rec.credits, 0))), package: pkgExpired ? '' : (rec.package || ''), packageExpiresAt: pkgExpired ? '' : (rec.packageExpiresAt || ''), freeImagesLeft: Math.max(0, Math.floor(numOr(rec.freeImagesLeft, 0))), freeSongTestUsed: rec.freeSongTestUsed === true, createdAt: rec.createdAt || '', lastUsedAt: rec.lastUsedAt || '', revoked: rec.revoked === true, usage: { songs: Math.max(0, Math.floor(numOr(u.songs, 0))), images: Math.max(0, Math.floor(numOr(u.images, 0))), videos: Math.max(0, Math.floor(numOr(u.videos, 0))), calls: Math.max(0, Math.floor(numOr(u.calls, 0))) } };
 }
-function apiKeyNewRecord(list, email, name, freeImages) {
+function apiKeyNewRecord(list, email, name, freeImages, expiry) {
   const arr = Array.isArray(list) ? list : [];
   const em = normEmail(email);
   const siblings = arr.filter((x) => x && String(x.email || '').toLowerCase() === em);
   const first = siblings.length === 0;
   const fullKey = apiNewKeyValue();
   const now = new Date().toISOString();
-  const record = { id: 'ak_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), key: fullKey, keyPrefix: apiKeyPrefixOf(fullKey), email: em, name: typeof name === 'string' ? name.trim().slice(0, 100) : '', credits: 0, package: '', packageExpiresAt: '', freeImagesLeft: first ? Math.max(0, Math.floor(numOr(freeImages, 4))) : 0, freeSongTestUsed: siblings.some((x) => x.freeSongTestUsed === true), createdAt: now, lastUsedAt: '', revoked: false, usage: { songs: 0, images: 0, videos: 0, calls: 0 } };
+  // API v2: expiry choice (1mo/3mo/1yr/unlimited). Old callers pass
+  // nothing -> 'unlimited', expiresAt null (old keys keep working).
+  const expNorm = apiKeyExpiryNormalize(expiry) || 'unlimited';
+  const expiresAt = apiKeyExpiresAt(expNorm, now);
+  const record = { id: 'ak_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), key: fullKey, keyPrefix: apiKeyPrefixOf(fullKey), email: em, name: typeof name === 'string' ? name.trim().slice(0, 100) : '', expiry: expNorm, expiresAt: expiresAt, credits: 0, package: '', packageExpiresAt: '', freeImagesLeft: first ? Math.max(0, Math.floor(numOr(freeImages, 4))) : 0, freeSongTestUsed: siblings.some((x) => x.freeSongTestUsed === true), createdAt: now, lastUsedAt: '', revoked: false, usage: { songs: 0, images: 0, videos: 0, calls: 0 } };
   return { record, fullKey };
 }
 // The free-song test is per USER, not per key: using it on one key
@@ -2636,17 +2667,30 @@ function apiKeyFindByValue(list, value) {
   if (!v) return null;
   return (Array.isArray(list) ? list : []).find((x) => x && x.key === v) || null;
 }
-function apiKeyAuthCheck(list, value) {
+// API v2 auth order: unknown -> 401 'api_key_invalid'; globally
+// disabled -> 503 'api_disabled'; user-blocked or revoked -> 403
+// 'api_key_revoked' (owner 2026-11-25 15:54); key-expired -> 401
+// 'api_key_expired'. A passed packageExpiresAt zeroes the package
+// credits here (cut off, no rollover) before the key is used.
+function apiKeyAuthCheck(list, value, opts) {
   const rec = apiKeyFindByValue(list, value);
-  if (!rec) return { ok: false, error: 'invalid_api_key' };
+  if (!rec) return { ok: false, error: 'api_key_invalid' };
+  const o = (opts && typeof opts === 'object') ? opts : {};
+  if (o.apiEnabled === false) return { ok: false, error: 'api_disabled' };
+  if (rec.blocked === true || apiUserBlocked(o.blockedUsers, rec.email)) return { ok: false, error: 'api_key_revoked' };
   if (rec.revoked) return { ok: false, error: 'api_key_revoked' };
+  if (apiKeyIsExpired(rec, o.nowMs)) return { ok: false, error: 'api_key_expired' };
+  apiKeyExpirePackageIfNeeded(rec, o.nowMs);
   return { ok: true, key: rec };
 }
 // Deduct `cost` API credits. Balance never goes negative: an
 // unaffordable charge is refused and the balance is left untouched.
 function apiKeyDeduct(rec, cost) {
-  if (!rec || typeof rec !== 'object') return { ok: false, error: 'invalid_api_key' };
+  if (!rec || typeof rec !== 'object') return { ok: false, error: 'api_key_invalid' };
   if (rec.revoked) return { ok: false, error: 'api_key_revoked' };
+  if (rec.blocked === true) return { ok: false, error: 'api_key_revoked' };
+  if (apiKeyIsExpired(rec)) return { ok: false, error: 'api_key_expired' };
+  apiKeyExpirePackageIfNeeded(rec);
   const c = Math.max(0, Math.floor(numOr(cost, 0)));
   const bal = Math.max(0, Math.floor(numOr(rec.credits, 0)));
   if (c <= 0) return { ok: true, cost: 0, balance: bal };
@@ -2657,9 +2701,13 @@ function apiKeyDeduct(rec, cost) {
 // Song charge: the per-user free test first (0 credits, flag consumed),
 // otherwise the configured song cost (default 12).
 function apiSongCharge(rec, settings) {
-  if (!rec || typeof rec !== 'object') return { ok: false, error: 'invalid_api_key' };
+  if (!rec || typeof rec !== 'object') return { ok: false, error: 'api_key_invalid' };
   if (rec.revoked) return { ok: false, error: 'api_key_revoked' };
+  if (rec.blocked === true) return { ok: false, error: 'api_key_revoked' };
+  if (apiKeyIsExpired(rec)) return { ok: false, error: 'api_key_expired' };
   const s = apiSettingsClean(settings);
+  if (s.apiEnabled === false) return { ok: false, error: 'api_disabled' };
+  apiKeyExpirePackageIfNeeded(rec);
   if (rec.freeSongTestUsed !== true) {
     rec.freeSongTestUsed = true;
     return { ok: true, free: true, cost: 0, balance: Math.max(0, Math.floor(numOr(rec.credits, 0))) };
@@ -2672,9 +2720,13 @@ function apiSongCharge(rec, settings) {
 // trial images are consumed first; after they run out, an active paid
 // API package is required when imageRequiresPackage is on.
 function apiImageCharge(rec, settings) {
-  if (!rec || typeof rec !== 'object') return { ok: false, error: 'invalid_api_key' };
+  if (!rec || typeof rec !== 'object') return { ok: false, error: 'api_key_invalid' };
   if (rec.revoked) return { ok: false, error: 'api_key_revoked' };
+  if (rec.blocked === true) return { ok: false, error: 'api_key_revoked' };
+  if (apiKeyIsExpired(rec)) return { ok: false, error: 'api_key_expired' };
   const s = apiSettingsClean(settings);
+  if (s.apiEnabled === false) return { ok: false, error: 'api_disabled' };
+  apiKeyExpirePackageIfNeeded(rec);
   const left = Math.max(0, Math.floor(numOr(rec.freeImagesLeft, 0)));
   if (left > 0) {
     rec.freeImagesLeft = left - 1;
@@ -2701,7 +2753,150 @@ function apiImageRatio(width, height) {
   return r;
 }
 function apiVideoUnavailable() { return { ok: false, error: 'video_not_available_yet', comingSoon: true }; }
+// ---- API v2 helpers (owner orders 2026-11-25 15:46 / 15:52 / 15:53 / 15:54) ----
+// Song models the app uses (localStorage "movai-song-model" ids):
+// v6 = V6 Ultra, v6-wild = V6 Pro, v6-mini = V6 Mini, v5.5 = V5.5.
+// The canonical code goes through the SAME sunoApiModel() path as the
+// app's own POST /api/gen/song (genBody.model = sunoApiModel(model)).
+const API_SONG_MODELS = [
+  { code: 'v6', label: 'V6 Ultra', suno: 'V6' },
+  { code: 'v6-wild', label: 'V6 Pro', suno: 'V6_WILD' },
+  { code: 'v6-mini', label: 'V6 Mini', suno: 'V6_MINI' },
+  { code: 'v5.5', label: 'V5.5', suno: 'V5_5' },
+];
+function apiSongModelsPublic() {
+  return API_SONG_MODELS.map((m) => ({ code: m.code, label: m.label, suno: m.suno }));
+}
+// Omitted/empty -> default 'v6'. A present-but-unknown value -> null
+// (the caller rejects it with 400 'invalid_model'). Accepts the app's
+// ids plus the underscore spellings sunoApiModel already accepts.
+function apiSongModelNormalize(m) {
+  if (m === undefined || m === null || (typeof m === 'string' && !m.trim())) return 'v6';
+  const s = String(m).trim().toLowerCase();
+  if (s === 'v6') return 'v6';
+  if (s === 'v6-wild' || s === 'v6_wild') return 'v6-wild';
+  if (s === 'v6-mini' || s === 'v6_mini') return 'v6-mini';
+  if (s === 'v5.5' || s === 'v5_5') return 'v5.5';
+  return null;
+}
+// Key-expiry choices offered at creation: 1mo = +30d, 3mo = +90d,
+// 1yr = +365d, unlimited = null (never expires).
+const API_KEY_EXPIRIES = { '1mo': 30, '3mo': 90, '1yr': 365, unlimited: null };
+function apiKeyExpiryNormalize(expiry) {
+  const s = typeof expiry === 'string' ? expiry.trim().toLowerCase() : '';
+  if (s === '1mo' || s === '3mo' || s === '1yr' || s === 'unlimited') return s;
+  return null;
+}
+function apiKeyExpiresAt(expiry, createdAt) {
+  const norm = apiKeyExpiryNormalize(expiry);
+  if (!norm || norm === 'unlimited') return null;
+  const days = API_KEY_EXPIRIES[norm];
+  const base = Date.parse(createdAt || '') || Date.now();
+  return new Date(base + days * 86400000).toISOString();
+}
+function apiKeyIsExpired(rec, nowMs) {
+  if (!rec || typeof rec !== 'object' || !rec.expiresAt) return false;
+  const t = Date.parse(rec.expiresAt);
+  if (!Number.isFinite(t)) return false;
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  return t <= now;
+}
+// Package-credit expiry (owner 2026-11-25 15:52): when a key's
+// packageExpiresAt passes, its package credits are CUT OFF (no
+// rollover). Non-mutating check + mutating enforcement (credits -> 0,
+// package cleared). The free trial flags are NOT package credits, so
+// expiry never touches freeImagesLeft / freeSongTestUsed.
+function apiKeyPackageExpired(rec, nowMs) {
+  if (!rec || typeof rec !== 'object' || !rec.packageExpiresAt) return false;
+  const t = Date.parse(rec.packageExpiresAt);
+  if (!Number.isFinite(t)) return false;
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  return t <= now;
+}
+function apiKeyExpirePackageIfNeeded(rec, nowMs) {
+  if (!apiKeyPackageExpired(rec, nowMs)) return false;
+  rec.credits = 0;
+  rec.package = '';
+  rec.packageExpiresAt = '';
+  return true;
+}
+// Per-key rate guard: max 60 calls/min/key -> 429 'rate_limited'.
+const API_V1_RATE_LIMIT = 60;
+const API_V1_RATE_WINDOW_MS = 60000;
+const apiV1RateCalls = new Map(); // keyId -> {start, count}
+function apiV1RateCheck(keyId, nowMs) {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const id = typeof keyId === 'string' ? keyId : '';
+  if (!id) return { ok: true };
+  let e = apiV1RateCalls.get(id);
+  if (!e || now - e.start >= API_V1_RATE_WINDOW_MS) { e = { start: now, count: 0 }; apiV1RateCalls.set(id, e); }
+  e.count += 1;
+  if (e.count > API_V1_RATE_LIMIT) return { ok: false, error: 'rate_limited', count: e.count, limit: API_V1_RATE_LIMIT };
+  return { ok: true, count: e.count, limit: API_V1_RATE_LIMIT };
+}
+// Remember which model an API song job used (kv_docs 'api-song-jobs':
+// {jobId: {model, createdAt}}) so POST /api/v1/songs/status can
+// report it. Survives restarts, unlike an in-memory map.
+function apiSongJobModelGet(jobs, jobId) {
+  if (!jobs || typeof jobs !== 'object' || typeof jobId !== 'string' || !jobId) return null;
+  const e = jobs[jobId];
+  if (!e || typeof e !== 'object' || typeof e.model !== 'string') return null;
+  return { model: e.model, sunoModel: sunoApiModel(e.model), createdAt: e.createdAt || '' };
+}
+function apiSongJobModelSet(jobs, jobId, model) {
+  const out = (jobs && typeof jobs === 'object' && !Array.isArray(jobs)) ? jobs : {};
+  if (typeof jobId === 'string' && jobId && typeof model === 'string' && model) out[jobId] = { model, createdAt: new Date().toISOString() };
+  return out;
+}
+// Per-user block list (kv_docs 'api-blocked-users': [email, ...]).
+// A blocked user cannot create new keys until unblocked; block-user
+// also revokes ALL of their keys at once (see POST /api/admin/api-keys).
+function apiUserBlocked(list, email) {
+  const em = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  if (!em) return false;
+  return (Array.isArray(list) ? list : []).some((x) => String(x || '').trim().toLowerCase() === em);
+}
+function apiBlockUser(list, email) {
+  const arr = Array.isArray(list) ? list : [];
+  const em = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  if (em && !apiUserBlocked(arr, em)) arr.push(em);
+  return arr;
+}
+function apiUnblockUser(list, email) {
+  const arr = Array.isArray(list) ? list : [];
+  const em = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  if (!em) return arr;
+  for (let i = arr.length - 1; i >= 0; i--) { if (String(arr[i] || '').trim().toLowerCase() === em) arr.splice(i, 1); }
+  return arr;
+}
+async function loadApiBlockedUsers() {
+  const j = await loadKvDoc('api-blocked-users', []);
+  if (!Array.isArray(j)) return [];
+  const out = [];
+  for (const x of j) { const e = typeof x === 'string' ? x.trim().toLowerCase() : ''; if (e && !out.includes(e)) out.push(e); }
+  return out;
+}
+async function saveApiBlockedUsers(arr) {
+  await saveKvDoc('api-blocked-users', Array.isArray(arr) ? arr : [], 'api-blocked-users.json');
+}
+// Key status for every public view (UI shows it RED unless 'active'):
+// 'blocked' = user-blocked (or globally disabled via ctx.apiEnabled),
+// 'revoked' = key revoked, 'expired' = key expiresAt passed,
+// 'active' = usable. A blocked/revoked/expired key is DEAD for /api/v1/*.
+function apiKeyStatus(rec, ctx) {
+  if (!rec || typeof rec !== 'object') return 'revoked';
+  const o = (ctx && typeof ctx === 'object') ? ctx : {};
+  const em = String(rec.email || '').toLowerCase();
+  if (rec.blocked === true || apiUserBlocked(o.blockedUsers, em)) return 'blocked';
+  if (o.apiEnabled === false) return 'blocked';
+  if (rec.revoked === true) return 'revoked';
+  if (apiKeyIsExpired(rec)) return 'expired';
+  return 'active';
+}
 function apiKeyRegenerateValue(rec) {
+  // Only the key VALUE changes — name, expiry/expiresAt, balance,
+  // package, trial flags and usage are all kept. Regenerating never
+  // un-revokes: a revoked/blocked key is rejected by the route first.
   const v = apiNewKeyValue();
   rec.key = v;
   rec.keyPrefix = apiKeyPrefixOf(v);
@@ -12502,33 +12697,84 @@ async function apiRoute(req, res, urlPath) {
   }
 
   // ---- Public API keys + /api/v1 (owner order 2026-11-25) ----
-  // v1 auth: Authorization: Bearer <key> or X-API-Key header. Billing
-  // errors use real HTTP codes (401 invalid/revoked key, 402 out of
-  // credits, 403 image needs a paid package); other failures follow the
-  // server convention of 200 {ok:false}. API credits never touch the
-  // app's Song Credits / media credits.
+  // v1 auth: Authorization: Bearer <key> or X-API-Key header. API v2
+  // (owner 2026-11-25 15:46/15:53/15:54): /api/v1/* returns REAL HTTP
+  // statuses, never 200 {ok:false}: 200/201 success; 400 bad request;
+  // 401 'api_key_invalid' (unknown key) / 'api_key_expired'; 402
+  // 'out_of_credits'; 403 'api_key_revoked' (revoked/blocked key),
+  // 'image_requires_package', 'browser_origin_forbidden'; 404
+  // 'job_not_found'; 429 'rate_limited'; 500 server error; 503
+  // 'api_disabled' (kill switch) / 'video_not_available_yet'. Error
+  // body stays {ok:false, error:'...'} — only the status changes.
+  // /api/public/* and /api/admin/* keep 200 {ok:false} (unchanged).
+  // API credits never touch the app's Song Credits / media credits.
   async function apiV1Auth(req) {
     try {
+      // Kill switch first: when the API is globally off, EVERY /api/v1/*
+      // call is 503 'api_disabled', whatever key it carries.
+      const s = await loadApiSettings();
+      if (s.apiEnabled === false) return { ok: false, error: 'api_disabled' };
       const h = String((req.headers && req.headers.authorization) || '');
       const m = /^Bearer\s+(.+)$/.exec(h);
       const val = m ? m[1].trim() : String((req.headers && req.headers['x-api-key']) || '').trim();
-      if (!val) return { ok: false, error: 'invalid_api_key' };
+      if (!val) return { ok: false, error: 'api_key_invalid' };
       const list = await loadApiKeys();
-      const chk = apiKeyAuthCheck(list, val);
+      const bu = await loadApiBlockedUsers().catch(() => []);
+      const chk = apiKeyAuthCheck(list, val, { blockedUsers: bu, apiEnabled: true });
       if (!chk.ok) return { ok: false, error: chk.error };
+      // Per-key rate guard: max 60 calls/min/key -> 429 'rate_limited'.
+      const rl = apiV1RateCheck(chk.key.id);
+      if (!rl.ok) return { ok: false, error: 'rate_limited' };
       return { ok: true, key: chk.key, list };
-    } catch (e) { return { ok: false, error: 'invalid_api_key' }; }
+    } catch (e) { return { ok: false, error: 'api_key_invalid' }; }
   }
   function apiV1Err(res, status, error, extra) {
     const out = { ok: false, error };
     if (extra && typeof extra === 'object') Object.assign(out, extra);
     return sendJSON(res, status, out);
   }
+  // HTTP status for an apiV1Auth failure (owner 2026-11-25 15:54):
+  // revoked/blocked -> 403, disabled -> 503, rate-limited -> 429,
+  // invalid/expired key -> 401.
+  function apiV1AuthStatus(error) {
+    if (error === 'rate_limited') return 429;
+    if (error === 'api_disabled') return 503;
+    if (error === 'api_key_revoked') return 403;
+    return 401;
+  }
+  // HTTP status for a charge failure: out of credits -> 402,
+  // revoked/blocked -> 403, disabled -> 503, invalid/expired -> 401.
+  function apiV1ChargeStatus(error) {
+    if (error === 'out_of_credits') return 402;
+    if (error === 'api_key_revoked') return 403;
+    if (error === 'api_disabled') return 503;
+    return 401;
+  }
+  // Server-only POST responses (songs/images/videos): NO CORS headers.
+  function apiV1PostErr(res, status, error, extra) {
+    const out = { ok: false, error };
+    if (extra && typeof extra === 'object') Object.assign(out, extra);
+    return sendJSON(res, status, out, { noCors: true });
+  }
+  function apiV1PostSend(res, status, obj) { return sendJSON(res, status, obj, { noCors: true }); }
+  // Any Origin header means a browser/Chrome call -> forbidden.
+  function apiV1HasBrowserOrigin(req) {
+    return !!(req.headers && typeof req.headers.origin === 'string' && req.headers.origin.trim());
+  }
+  // Public view of a key with live status context (blocked users +
+  // kill switch) for the key-management responses below.
+  async function apiKeyViewCtx() {
+    let blockedUsers = [];
+    try { blockedUsers = await loadApiBlockedUsers(); } catch (e) {}
+    let apiEnabled = true;
+    try { apiEnabled = (await loadApiSettings()).apiEnabled !== false; } catch (e) {}
+    return { blockedUsers, apiEnabled };
+  }
   // GET /api/public/api-packages — PUBLIC. The 5 API packages + costs,
   // for the API docs / pricing page (shown next to the app packages).
   if (req.method === 'GET' && urlPath === '/api/public/api-packages') {
     const s = await loadApiSettings();
-    return sendJSON(res, 200, { ok: true, packages: apiPackagesPublic(), costs: { song: s.songCost, image: s.imageCost, video: s.videoCost }, videoAvailable: false });
+    return sendJSON(res, 200, { ok: true, packages: apiPackagesPublic(), models: apiSongModelsPublic(), costs: { song: s.songCost, image: s.imageCost, video: s.videoCost }, videoAvailable: false, apiEnabled: s.apiEnabled !== false });
   }
   // POST /api/public/api-keys — {email, name?} — signed-in MovAi user.
   // Creates a key; the FULL key is returned ONLY here (field `key`).
@@ -12539,12 +12785,19 @@ async function apiRoute(req, res, urlPath) {
       const users = await loadUsers();
       const u = users[email];
       if (!u) return sendJSON(res, 200, { ok: false, error: 'Please sign in first', needLogin: true });
+      // A blocked user cannot create new keys until unblocked.
+      const blockedUsers = await loadApiBlockedUsers();
+      if (apiUserBlocked(blockedUsers, email)) return sendJSON(res, 200, { ok: false, error: 'user_blocked' });
+      // API v2: {name, expiry} — expiry must be 1mo/3mo/1yr/unlimited.
+      const expiryRaw = body && typeof body.expiry === 'string' ? body.expiry.trim() : '';
+      if (expiryRaw && !apiKeyExpiryNormalize(expiryRaw)) return sendJSON(res, 200, { ok: false, error: 'invalid_expiry' });
       const settings = await loadApiSettings();
       const list = await loadApiKeys();
-      const made = apiKeyNewRecord(list, email, (body && typeof body.name === 'string' ? body.name : '') || u.name || '', settings.freeImages);
+      const made = apiKeyNewRecord(list, email, (body && typeof body.name === 'string' ? body.name : '') || u.name || '', settings.freeImages, expiryRaw || 'unlimited');
       list.push(made.record);
       await saveApiKeys(list);
-      return sendJSON(res, 200, { ok: true, key: made.fullKey, apiKey: apiKeyPublic(made.record) });
+      const vctx = await apiKeyViewCtx();
+      return sendJSON(res, 200, { ok: true, key: made.fullKey, apiKey: apiKeyPublic(made.record, vctx) });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
     return;
   }
@@ -12553,7 +12806,8 @@ async function apiRoute(req, res, urlPath) {
     const email = normEmail(new URL(req.url, 'http://localhost').searchParams.get('email') || '');
     if (!email) return sendJSON(res, 200, { ok: false, error: 'Please sign in first', needLogin: true });
     const list = await loadApiKeys();
-    return sendJSON(res, 200, { ok: true, keys: list.filter((x) => x && String(x.email || '').toLowerCase() === email).map(apiKeyPublic) });
+    const vctx = await apiKeyViewCtx();
+    return sendJSON(res, 200, { ok: true, keys: list.filter((x) => x && String(x.email || '').toLowerCase() === email).map((x) => apiKeyPublic(x, vctx)) });
   }
   // POST /api/public/api-keys/revoke — {email, id} — revoke your own key.
   if (req.method === 'POST' && urlPath === '/api/public/api-keys/revoke') {
@@ -12567,7 +12821,8 @@ async function apiRoute(req, res, urlPath) {
       rec.revoked = true;
       rec.revokedAt = new Date().toISOString();
       await saveApiKeys(list);
-      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec) });
+      const vctx = await apiKeyViewCtx();
+      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec, vctx) });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
     return;
   }
@@ -12582,10 +12837,14 @@ async function apiRoute(req, res, urlPath) {
       const list = await loadApiKeys();
       const rec = list.find((x) => x && x.id === id && String(x.email || '').toLowerCase() === email);
       if (!rec) return sendJSON(res, 200, { ok: false, error: 'API key not found' });
+      // Regenerate never un-revokes: a blocked user's keys stay dead.
+      const bu = await loadApiBlockedUsers();
+      if (apiUserBlocked(bu, email) || rec.blocked === true) return sendJSON(res, 200, { ok: false, error: 'user_blocked' });
       if (rec.revoked) return sendJSON(res, 200, { ok: false, error: 'api_key_revoked' });
       const fullKey = apiKeyRegenerateValue(rec);
       await saveApiKeys(list);
-      return sendJSON(res, 200, { ok: true, key: fullKey, apiKey: apiKeyPublic(rec) });
+      const vctx = await apiKeyViewCtx();
+      return sendJSON(res, 200, { ok: true, key: fullKey, apiKey: apiKeyPublic(rec, vctx) });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
     return;
   }
@@ -12594,21 +12853,24 @@ async function apiRoute(req, res, urlPath) {
   if (req.method === 'GET' && urlPath === '/api/v1/balance') {
     (async () => {
       const auth = await apiV1Auth(req);
-      if (!auth.ok) return apiV1Err(res, 401, auth.error);
+      if (!auth.ok) return apiV1Err(res, apiV1AuthStatus(auth.error), auth.error);
       const s = await loadApiSettings();
       const k = auth.key;
-      return sendJSON(res, 200, { ok: true, credits: Math.max(0, Math.floor(numOr(k.credits, 0))), package: k.package || '', packageExpiresAt: k.packageExpiresAt || '', freeImagesLeft: Math.max(0, Math.floor(numOr(k.freeImagesLeft, 0))), freeSongTestUsed: k.freeSongTestUsed === true, costs: { song: s.songCost, image: s.imageCost, video: s.videoCost }, usage: (k.usage && typeof k.usage === 'object') ? k.usage : { songs: 0, images: 0, videos: 0, calls: 0 }, email: k.email });
-    })().catch(() => sendJSON(res, 200, { ok: false, error: 'balance failed' }));
+      const bu = await loadApiBlockedUsers().catch(() => []);
+      return sendJSON(res, 200, { ok: true, name: k.name || '', expiresAt: k.expiresAt || null, status: apiKeyStatus(k, { blockedUsers: bu, apiEnabled: s.apiEnabled }), credits: Math.max(0, Math.floor(numOr(k.credits, 0))), package: k.package || '', packageExpiresAt: k.packageExpiresAt || '', freeImagesLeft: Math.max(0, Math.floor(numOr(k.freeImagesLeft, 0))), freeSongTestUsed: k.freeSongTestUsed === true, costs: { song: s.songCost, image: s.imageCost, video: s.videoCost }, usage: (k.usage && typeof k.usage === 'object') ? k.usage : { songs: 0, images: 0, videos: 0, calls: 0 }, email: k.email });
+    })().catch(() => sendJSON(res, 500, { ok: false, error: 'balance failed' }));
     return;
   }
   // GET /api/v1/usage — API-key auth. Usage counters for the key.
   if (req.method === 'GET' && urlPath === '/api/v1/usage') {
     (async () => {
       const auth = await apiV1Auth(req);
-      if (!auth.ok) return apiV1Err(res, 401, auth.error);
+      if (!auth.ok) return apiV1Err(res, apiV1AuthStatus(auth.error), auth.error);
       const k = auth.key;
-      return sendJSON(res, 200, { ok: true, usage: (k.usage && typeof k.usage === 'object') ? k.usage : { songs: 0, images: 0, videos: 0, calls: 0 }, credits: Math.max(0, Math.floor(numOr(k.credits, 0))), package: k.package || '', freeImagesLeft: Math.max(0, Math.floor(numOr(k.freeImagesLeft, 0))), freeSongTestUsed: k.freeSongTestUsed === true, lastUsedAt: k.lastUsedAt || '' });
-    })().catch(() => sendJSON(res, 200, { ok: false, error: 'usage failed' }));
+      const s = await loadApiSettings();
+      const bu = await loadApiBlockedUsers().catch(() => []);
+      return sendJSON(res, 200, { ok: true, usage: (k.usage && typeof k.usage === 'object') ? k.usage : { songs: 0, images: 0, videos: 0, calls: 0 }, credits: Math.max(0, Math.floor(numOr(k.credits, 0))), package: k.package || '', expiresAt: k.expiresAt || null, status: apiKeyStatus(k, { blockedUsers: bu, apiEnabled: s.apiEnabled }), freeImagesLeft: Math.max(0, Math.floor(numOr(k.freeImagesLeft, 0))), freeSongTestUsed: k.freeSongTestUsed === true, lastUsedAt: k.lastUsedAt || '' });
+    })().catch(() => sendJSON(res, 500, { ok: false, error: 'usage failed' }));
     return;
   }
   // POST /api/v1/songs — API-key auth. REUSES the app's Suno path
@@ -12619,24 +12881,32 @@ async function apiRoute(req, res, urlPath) {
   // over the API yet. Returns {ok, jobId, songs:2, ...}; poll
   // POST /api/v1/songs/status for the finished songs.
   if (req.method === 'POST' && urlPath === '/api/v1/songs') {
+    // API v2: server-side only — any Origin header (browser/Chrome) is
+    // rejected 403 with NO CORS headers, before auth or any charge.
+    if (apiV1HasBrowserOrigin(req)) return apiV1PostErr(res, 403, 'browser_origin_forbidden');
     readJSONBody(req, 256 * 1024).then(async (body) => {
       try {
         const auth = await apiV1Auth(req);
-        if (!auth.ok) return apiV1Err(res, 401, auth.error);
+        if (!auth.ok) return apiV1PostErr(res, apiV1AuthStatus(auth.error), auth.error);
         const b = body && typeof body === 'object' ? body : {};
-        if (typeof b.prompt !== 'string' && typeof b.title !== 'string' && typeof b.lyrics !== 'string' && typeof b.style !== 'string') return sendJSON(res, 200, { ok: false, error: 'prompt, title, lyrics or style is required' });
+        if (typeof b.prompt !== 'string' && typeof b.title !== 'string' && typeof b.lyrics !== 'string' && typeof b.style !== 'string') return apiV1PostErr(res, 400, 'prompt, title, lyrics or style is required');
         const title = typeof b.title === 'string' ? b.title.trim().slice(0, 200) : '';
         const lyrics = typeof b.lyrics === 'string' ? b.lyrics.trim().slice(0, 10000) : '';
         const style = typeof b.style === 'string' ? b.style.trim().slice(0, 500) : '';
         const voice = b.voice === 'male' || b.voice === 'female' ? b.voice : 'random';
         const prompt = typeof b.prompt === 'string' ? b.prompt.trim().slice(0, 10000) : '';
-        const model = typeof b.model === 'string' && b.model.trim() ? b.model.trim().slice(0, 50) : 'v6';
+        // API v2 model: omitted/empty -> 'v6'; a present-but-unknown
+        // value -> 400 'invalid_model'. Validated BEFORE any charge.
+        // The canonical code goes through the SAME sunoApiModel() path
+        // as the app's own POST /api/gen/song (see genBody below).
+        const model = apiSongModelNormalize(typeof b.model === 'string' ? b.model : undefined);
+        if (model === null) return apiV1PostErr(res, 400, 'invalid_model');
         const instrumental = b.instrumental === true || b.make_instrumental === true;
-        if (!title && !lyrics && !style && !prompt) return sendJSON(res, 200, { ok: false, error: 'prompt, title, lyrics or style is required' });
+        if (!title && !lyrics && !style && !prompt) return apiV1PostErr(res, 400, 'prompt, title, lyrics or style is required');
         const sunoKeys = (await adminProviderKeyList('suno')).filter((e) => e.endpoint);
         if (!sunoKeys.length) {
-          if (!(await adminProviderKeyList('suno')).length) return sendJSON(res, 200, { ok: false, error: 'Admin has not added a Suno key yet' });
-          return sendJSON(res, 200, { ok: false, error: 'Admin has not added a Suno endpoint yet' });
+          if (!(await adminProviderKeyList('suno')).length) return apiV1PostErr(res, 503, 'Admin has not added a Suno key yet');
+          return apiV1PostErr(res, 503, 'Admin has not added a Suno endpoint yet');
         }
         const settings = await loadApiSettings();
         const keyRec = auth.key;
@@ -12646,8 +12916,8 @@ async function apiRoute(req, res, urlPath) {
         if (keyList.some((x) => x && String(x.email || '').toLowerCase() === String(keyRec.email || '').toLowerCase() && x.freeSongTestUsed === true)) keyRec.freeSongTestUsed = true;
         const charge = apiSongCharge(keyRec, settings);
         if (!charge.ok) {
-          if (charge.error === 'out_of_credits') return apiV1Err(res, 402, 'out_of_credits', { cost: charge.cost, balance: charge.balance, needBuy: true });
-          return apiV1Err(res, 401, charge.error);
+          if (charge.error === 'out_of_credits') return apiV1PostErr(res, 402, 'out_of_credits', { cost: charge.cost, balance: charge.balance, needBuy: true });
+          return apiV1PostErr(res, apiV1ChargeStatus(charge.error), charge.error);
         }
         await saveApiKeys(keyList);
         const genBody = { customMode: true, instrumental, callBackUrl: SUNO_CALLBACK_URL, model: sunoApiModel(model), style: (style || 'pop').slice(0, 1000), lyrics: instrumental ? '' : (lyrics || prompt || '').slice(0, 5000), title: title.slice(0, 80) };
@@ -12670,14 +12940,17 @@ async function apiRoute(req, res, urlPath) {
           if (charge.free) { try { apiUnmarkFreeSongUsedForUser(keyList, keyRec.email); } catch (e2) {} }
           else { keyRec.credits = Math.max(0, Math.floor(numOr(keyRec.credits, 0)) + charge.cost); }
           try { await saveApiKeys(keyList); } catch (e2) {}
-          return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Suno: request failed' });
+          return apiV1PostErr(res, 500, (e && e.message) || 'Suno: request failed');
         }
         if (charge.free) { try { apiMarkFreeSongUsedForUser(keyList, keyRec.email); } catch (e2) {} }
         apiKeyRecordUsage(keyRec, 'song', 2);
         try { await saveApiKeys(keyList); } catch (e2) {}
-        return sendJSON(res, 200, { ok: true, jobId: out.jobId, songs: 2, expectedSongs: 2, cost: charge.cost, free: charge.free === true, credits: keyRec.credits, freeSongTestUsed: keyRec.freeSongTestUsed === true, status: 'generating', statusUrl: '/api/v1/songs/status' });
-      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'Suno: request failed — ' + (e && e.message ? e.message : 'unknown') }); }
-    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+        // API v2: remember which model this job used so
+        // POST /api/v1/songs/status can report it.
+        try { const _jobs = apiSongJobModelSet(await loadKvDoc('api-song-jobs', {}), out.jobId, model); await saveKvDoc('api-song-jobs', _jobs, 'api-song-jobs.json'); } catch (e2) {}
+        return apiV1PostSend(res, 200, { ok: true, jobId: out.jobId, songs: 2, expectedSongs: 2, cost: charge.cost, free: charge.free === true, credits: keyRec.credits, freeSongTestUsed: keyRec.freeSongTestUsed === true, model: model, sunoModel: genBody.model, status: 'generating', statusUrl: '/api/v1/songs/status' });
+      } catch (e) { return apiV1PostErr(res, 500, 'Suno: request failed — ' + (e && e.message ? e.message : 'unknown')); }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request'), { noCors: true }));
     return;
   }
   // POST /api/v1/songs/status — API-key auth. {jobId} → the same Suno
@@ -12687,31 +12960,36 @@ async function apiRoute(req, res, urlPath) {
     readJSONBody(req, 64 * 1024).then(async (body) => {
       try {
         const auth = await apiV1Auth(req);
-        if (!auth.ok) return apiV1Err(res, 401, auth.error);
+        if (!auth.ok) return apiV1Err(res, apiV1AuthStatus(auth.error), auth.error);
         const jobId = body && typeof body.jobId === 'string' ? body.jobId.trim() : '';
-        if (!jobId) return sendJSON(res, 200, { ok: false, error: 'jobId is required' });
+        if (!jobId) return apiV1Err(res, 400, 'jobId is required');
+        // API v2: report the model this job was generated with.
+        let jobModel = null;
+        try { jobModel = apiSongJobModelGet(await loadKvDoc('api-song-jobs', {}), jobId); } catch (e) {}
+        const modelFields = jobModel ? { model: jobModel.model, sunoModel: jobModel.sunoModel } : {};
         const sunoKeys = (await adminProviderKeyList('suno')).filter((e) => e.endpoint);
-        if (!sunoKeys.length) return sendJSON(res, 200, { ok: false, error: 'Admin has not added a Suno key/endpoint yet' });
+        if (!sunoKeys.length) return apiV1Err(res, 503, 'Admin has not added a Suno key/endpoint yet');
         let ss = null;
         try { ss = await sunoStreamLoad(jobId); } catch (e) {}
         if (ss && ss.status === 'ready' && ss.songs && ss.songs.length) {
-          return sendJSON(res, 200, { ok: true, status: 'done', songs: sunoStreamToSongs(ss) });
+          return sendJSON(res, 200, Object.assign({ ok: true, status: 'done', songs: sunoStreamToSongs(ss) }, modelFields));
         }
         if (ss && ss.status === 'streaming' && ss.songs && ss.songs.length) {
           const sp = sunoStreamToSongs(ss);
-          return sendJSON(res, 200, { ok: true, status: 'working', providerStatus: 'first', preview: sp.length ? (sp[0].streamAudioUrl || sp[0].url) : '', songs: sp });
+          return sendJSON(res, 200, Object.assign({ ok: true, status: 'working', providerStatus: 'first', preview: sp.length ? (sp[0].streamAudioUrl || sp[0].url) : '', songs: sp }, modelFields));
         }
-        if (ss && ss.status === 'failed') return sendJSON(res, 200, { ok: false, error: 'Suno: generation failed' });
+        if (ss && ss.status === 'failed') return apiV1Err(res, 500, 'Suno: generation failed');
         const cb = sunoCallbacks.get(jobId);
         if (cb && cb.status === 'SUCCESS' && cb.songs && cb.songs.length) {
-          return sendJSON(res, 200, { ok: true, status: 'done', songs: sunoSongsKeepEarlyUrl(cb.songs, cb.firstSongs) });
+          return sendJSON(res, 200, Object.assign({ ok: true, status: 'done', songs: sunoSongsKeepEarlyUrl(cb.songs, cb.firstSongs) }, modelFields));
         }
         const cached = sunoRecInfoCache.get(jobId);
         if (cached && cached.out && Date.now() - cached.at < 12000) {
-          return sendJSON(res, 200, Object.assign({ ok: true }, cached.out));
+          return sendJSON(res, 200, Object.assign({ ok: true }, cached.out, modelFields));
         }
         let out;
         let jobFailed = false;
+        let jobNotFound = false;
         try {
           out = await withProviderKeyRotation('suno', async (k, endpoint) => {
             const ep = endpoint.replace(/\/+$/, '');
@@ -12719,7 +12997,7 @@ async function apiRoute(req, res, urlPath) {
             const j = await r.json().catch(() => null);
             if (r.status === 401 || r.status === 403 || r.status === 429) throw rotErr('Suno: ' + sunoErrText(j, 'HTTP ' + r.status), r.status);
             const d = (j && j.data) || null;
-            if (!d || typeof d.status !== 'string') { jobFailed = true; throw rotErr('Suno: could not find this job', r.status); }
+            if (!d || typeof d.status !== 'string') { jobFailed = true; jobNotFound = true; throw rotErr('Suno: could not find this job', r.status); }
             const st = d.status.toUpperCase();
             if (st === 'SUCCESS') {
               const songs = sunoSongsKeepEarlyUrl(sunoSongsFromData(d), cb && cb.firstSongs);
@@ -12739,13 +13017,14 @@ async function apiRoute(req, res, urlPath) {
             throw rotErr('Suno: ' + (d.errorMessage || ('generation failed · ' + st)), r.status);
           }, '', sunoKeys);
         } catch (e) {
-          if (jobFailed) return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Suno: request failed' });
-          if (ss && ss.status === 'generating') return sendJSON(res, 200, { ok: true, status: 'working', providerStatus: 'text', lyrics: ss.lyrics || '' });
-          return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Suno: request failed' });
+          if (jobNotFound) return apiV1Err(res, 404, 'job_not_found', { message: 'Suno: could not find this job' });
+          if (jobFailed) return apiV1Err(res, 500, (e && e.message) || 'Suno: request failed');
+          if (ss && ss.status === 'generating') return sendJSON(res, 200, Object.assign({ ok: true, status: 'working', providerStatus: 'text', lyrics: ss.lyrics || '' }, modelFields));
+          return apiV1Err(res, 500, (e && e.message) || 'Suno: request failed');
         }
         try { sunoRecInfoCache.set(jobId, { at: Date.now(), out }); if (sunoRecInfoCache.size > 200) { const rk = sunoRecInfoCache.keys().next().value; sunoRecInfoCache.delete(rk); } } catch (e) {}
-        return sendJSON(res, 200, Object.assign({ ok: true }, out));
-      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'Suno: request failed — ' + (e && e.message ? e.message : 'unknown') }); }
+        return sendJSON(res, 200, Object.assign({ ok: true }, out, modelFields));
+      } catch (e) { return apiV1Err(res, 500, 'Suno: request failed — ' + (e && e.message ? e.message : 'unknown')); }
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
     return;
   }
@@ -12756,19 +13035,22 @@ async function apiRoute(req, res, urlPath) {
   // The 4 trial images are consumed first; after that an active paid
   // API package is required (imageRequiresPackage setting).
   if (req.method === 'POST' && urlPath === '/api/v1/images') {
+    // API v2: server-side only — any Origin header (browser/Chrome) is
+    // rejected 403 with NO CORS headers, before auth or any charge.
+    if (apiV1HasBrowserOrigin(req)) return apiV1PostErr(res, 403, 'browser_origin_forbidden');
     readJSONBody(req, 64 * 1024).then(async (body) => {
       try {
         const auth = await apiV1Auth(req);
-        if (!auth.ok) return apiV1Err(res, 401, auth.error);
+        if (!auth.ok) return apiV1PostErr(res, apiV1AuthStatus(auth.error), auth.error);
         const b = body && typeof body === 'object' ? body : {};
-        if (!b.prompt || typeof b.prompt !== 'string' || !b.prompt.trim()) return sendJSON(res, 200, { ok: false, error: 'prompt is required' });
+        if (!b.prompt || typeof b.prompt !== 'string' || !b.prompt.trim()) return apiV1PostErr(res, 400, 'prompt is required');
         const settings = await loadApiSettings();
         const keyRec = auth.key;
         const keyList = auth.list;
         const charge = apiImageCharge(keyRec, settings);
         if (!charge.ok) {
-          if (charge.error === 'image_requires_package') return apiV1Err(res, 403, 'image_requires_package', { message: 'Free images used up — image generation now requires an active paid API package', freeImagesLeft: 0 });
-          return apiV1Err(res, 401, charge.error);
+          if (charge.error === 'image_requires_package') return apiV1PostErr(res, 403, 'image_requires_package', { message: 'Free images used up — image generation now requires an active paid API package', freeImagesLeft: 0 });
+          return apiV1PostErr(res, apiV1ChargeStatus(charge.error), charge.error);
         }
         await saveApiKeys(keyList);
         let prompt = b.prompt.trim().slice(0, 2000);
@@ -12801,24 +13083,27 @@ async function apiRoute(req, res, urlPath) {
         }
         if (!out) {
           if (charge.free) { keyRec.freeImagesLeft = Math.max(0, Math.floor(numOr(keyRec.freeImagesLeft, 0))) + 1; try { await saveApiKeys(keyList); } catch (e2) {} }
-          return sendJSON(res, 200, { ok: false, error: (lastErr && lastErr.message) || 'Agnes: request failed' });
+          return apiV1PostErr(res, 500, (lastErr && lastErr.message) || 'Agnes: request failed');
         }
         apiKeyRecordUsage(keyRec, 'image', 1);
         try { await saveApiKeys(keyList); } catch (e2) {}
-        if (out.imageUrl) return sendJSON(res, 200, { ok: true, imageUrl: out.imageUrl, provider: 'agnes', model: usedModel, cost: 0, free: charge.free === true, freeImagesLeft: keyRec.freeImagesLeft, credits: keyRec.credits });
-        return sendJSON(res, 200, { ok: true, jobId: out.jobId, status: 'processing', provider: 'agnes', model: usedModel, cost: 0, free: charge.free === true, freeImagesLeft: keyRec.freeImagesLeft, credits: keyRec.credits });
-      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'Image: request failed — ' + (e && e.message ? e.message : 'unknown') }); }
-    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+        if (out.imageUrl) return apiV1PostSend(res, 200, { ok: true, imageUrl: out.imageUrl, provider: 'agnes', model: usedModel, cost: 0, free: charge.free === true, freeImagesLeft: keyRec.freeImagesLeft, credits: keyRec.credits });
+        return apiV1PostSend(res, 200, { ok: true, jobId: out.jobId, status: 'processing', provider: 'agnes', model: usedModel, cost: 0, free: charge.free === true, freeImagesLeft: keyRec.freeImagesLeft, credits: keyRec.credits });
+      } catch (e) { return apiV1PostErr(res, 500, 'Image: request failed — ' + (e && e.message ? e.message : 'unknown')); }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request'), { noCors: true }));
     return;
   }
   // POST /api/v1/videos — API-key auth, then Coming Soon. Video
   // generation is NOT built: no provider is ever called.
   if (req.method === 'POST' && urlPath === '/api/v1/videos') {
+    // API v2: server-side only — any Origin header (browser/Chrome) is
+    // rejected 403 with NO CORS headers, before auth.
+    if (apiV1HasBrowserOrigin(req)) return apiV1PostErr(res, 403, 'browser_origin_forbidden');
     readJSONBody(req, 64 * 1024).then(async () => {
       const auth = await apiV1Auth(req);
-      if (!auth.ok) return apiV1Err(res, 401, auth.error);
-      return sendJSON(res, 503, apiVideoUnavailable());
-    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+      if (!auth.ok) return apiV1PostErr(res, apiV1AuthStatus(auth.error), auth.error);
+      return apiV1PostSend(res, 503, apiVideoUnavailable());
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request'), { noCors: true }));
     return;
   }
   // GET /api/admin/api-keys — admin key required. All keys, masked.
@@ -12826,7 +13111,8 @@ async function apiRoute(req, res, urlPath) {
     const a = await adminKeyOk(req);
     if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
     const list = await loadApiKeys();
-    return sendJSON(res, 200, { ok: true, keys: list.map(apiKeyPublic), count: list.length });
+    const vctx = await apiKeyViewCtx();
+    return sendJSON(res, 200, { ok: true, keys: list.map((x) => apiKeyPublic(x, vctx)), count: list.length });
   }
   // POST /api/admin/api-keys — {id, action:'revoke'|'unrevoke'} or
   // {id, revoked:true|false} — admin key required.
@@ -12834,6 +13120,29 @@ async function apiRoute(req, res, urlPath) {
     const a = await adminKeyOk(req);
     if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
     readJSONBody(req, 64 * 1024).then(async (body) => {
+      // API v2 per-user block (owner 2026-11-25 15:53): {email,
+      // action:'block-user'} revokes ALL keys of one email at once and
+      // records the email as blocked, so the user cannot create new
+      // keys until unblocked. 'unblock-user' lifts the block (keys
+      // stay revoked until an admin un-revokes them one by one).
+      if (body && (body.action === 'block-user' || body.action === 'unblock-user')) {
+        const em = normEmail(body.email);
+        if (!em) return sendJSON(res, 200, { ok: false, error: 'email is required' });
+        const blocked = await loadApiBlockedUsers();
+        const list = await loadApiKeys();
+        let n = 0;
+        if (body.action === 'block-user') {
+          apiBlockUser(blocked, em);
+          for (const x of list) { if (x && String(x.email || '').toLowerCase() === em) { if (!x.revoked) { x.revoked = true; x.revokedAt = new Date().toISOString(); } x.blocked = true; n++; } }
+        } else {
+          apiUnblockUser(blocked, em);
+          for (const x of list) { if (x && String(x.email || '').toLowerCase() === em) { x.blocked = false; n++; } }
+        }
+        await saveApiBlockedUsers(blocked);
+        await saveApiKeys(list);
+        const vctx = await apiKeyViewCtx();
+        return sendJSON(res, 200, { ok: true, email: em, action: body.action, blocked: body.action === 'block-user', keysAffected: n, keys: list.filter((x) => x && String(x.email || '').toLowerCase() === em).map((x) => apiKeyPublic(x, vctx)) });
+      }
       const id = body && typeof body.id === 'string' ? body.id.trim() : '';
       let rev = null;
       if (body && body.action === 'revoke') rev = true;
@@ -12847,7 +13156,8 @@ async function apiRoute(req, res, urlPath) {
       rec.revoked = rev;
       rec.revokedAt = rev ? new Date().toISOString() : '';
       await saveApiKeys(list);
-      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec) });
+      const vctx = await apiKeyViewCtx();
+      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec, vctx) });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
     return;
   }
@@ -12871,11 +13181,13 @@ async function apiRoute(req, res, urlPath) {
         const p = apiPackageById(body.package);
         if (!p) return sendJSON(res, 200, { ok: false, error: 'unknown API package: ' + body.package.trim() });
         rec.package = p.id;
-        rec.packageExpiresAt = new Date(Date.now() + 30 * 86400000).toISOString();
+        // API v2: expiry from the PACKAGE's own duration (30/150/365d).
+        rec.packageExpiresAt = apiPackageExpiresAt(p);
       }
       await saveApiKeys(list);
       try { await addNotification('grant', rec.email, '➕ API credits granted', '+' + amount + ' API credits to key ' + apiKeyMask(rec.key || '') + ' (balance ' + rec.credits + ')', { extra: { apiCredits: true, apiKeyId: rec.id, amount } }); } catch (e) {}
-      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec) });
+      const vctx = await apiKeyViewCtx();
+      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec, vctx) });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
     return;
   }
@@ -13292,7 +13604,7 @@ async function apiRoute(req, res, urlPath) {
         postType: kind === 'discount' ? postType : '',
         plan: kind === 'device-slot' ? 'Gmail Slot · 1 Gmail' : (kind === 'pin-delete' ? 'Delete 6-digit PIN · លុបលេខកូដ 6 ខ្ទង់' : (kind === 'discount' ? discLabel : (kind === 'api-package' ? ('API Package · ' + packageId) : (typeof body.plan === 'string' ? body.plan.slice(0, 50) : packageId)))),
         amount: (kind === 'device-slot' || kind === 'pin-delete') ? dsSlotPrice : (kind === 'discount' ? DISCOUNT_PACK[feature].price : (kind === 'api-package' ? apiPkg.price : pkg.price)),
-        credits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? apiPkg.credits : pkg.credits)), songCredits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? 0 : pkg.songCredits)), days: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? 30 : pkg.days)),
+        credits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? apiPkg.credits : pkg.credits)), songCredits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? 0 : pkg.songCredits)), days: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? apiPkg.durationDays : pkg.days)),
         fingerprint: (kind === 'device-slot' || kind === 'pin-delete') ? dsFingerprint : '',
         apiKeyId: kind === 'api-package' ? apiKeyId : '',
         receiptUrl: typeof body.receiptUrl === 'string' ? body.receiptUrl.trim().slice(0, 500) : '',
@@ -13443,7 +13755,10 @@ async function apiRoute(req, res, urlPath) {
         const apNow = new Date().toISOString();
         akRec.credits = Math.max(0, Math.floor(numOr(akRec.credits, 0))) + apPkg.credits;
         akRec.package = apPkg.id;
-        akRec.packageExpiresAt = new Date(Date.now() + 30 * 86400000).toISOString();
+        // API v2: expiry from the PACKAGE's own duration (30/150/365d).
+        // A new purchase grants FRESH credits with a new expiry; any
+        // leftover from the old period was already cut off at its expiry.
+        akRec.packageExpiresAt = apiPackageExpiresAt(apPkg);
         await saveApiKeys(akList);
         r.status = 'approved';
         r.decidedAt = apNow;
@@ -13452,7 +13767,8 @@ async function apiRoute(req, res, urlPath) {
         scheduleBackup('purchase-requests.json');
         await addNotification('purchase-approved', r.email, '✅ បានអនុម័ត · API package approved', 'កញ្ចប់ API ' + apPkg.id + ' ($' + walletMoney(apPkg.price).toFixed(2) + ') បានអនុម័ត — +' + apPkg.credits + ' API credits ចូល Key ' + apiKeyMask(akRec.key || '') + ' (នៅសល់ ' + akRec.credits + ')', { extra: { apiPackage: true, pkg: apPkg.id, apiKeyId: akRec.id, buyerId: apU.id || '—', decision: 'approved' } });
         await markPurchaseRequestDecided(r.email, r.packageId, 'approved', apNow);
-        return sendJSON(res, 200, { ok: true, request: r, apiKey: apiKeyPublic(akRec) });
+        const vctx = await apiKeyViewCtx();
+        return sendJSON(res, 200, { ok: true, request: r, apiKey: apiKeyPublic(akRec, vctx) });
       }
       const pkg = (r.kind === 'discount' || r.kind === 'song-sale' || r.type === 'song-sale') ? null : (await loadPackages())[r.packageId];
       if (!pkg && r.kind !== 'discount' && r.kind !== 'song-sale' && r.type !== 'song-sale') return sendJSON(res, 200, { ok: false, error: 'កញ្ចប់នេះមិនស្គាល់ទេ' });
@@ -17557,6 +17873,13 @@ const server = http.createServer((req, res) => {
   let urlPath = decodeURIComponent(req.url.split('?')[0]);
   // CORS preflight for /api/* (the website and Admin app are other origins;
   // the Admin app also sends an Authorization header, which always preflights).
+  // API v2: the three server-only POST endpoints get NO CORS grant even
+  // on preflight — a browser preflight must fail, so Chrome can never
+  // call POST /api/v1/songs, /api/v1/images or /api/v1/videos.
+  if (req.method === 'OPTIONS' && (urlPath === '/api/v1/songs' || urlPath === '/api/v1/images' || urlPath === '/api/v1/videos')) {
+    res.writeHead(204);
+    return res.end();
+  }
   if (req.method === 'OPTIONS' && urlPath.startsWith('/api/')) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
