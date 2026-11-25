@@ -969,7 +969,7 @@ async function pubUser(u, modelLogins, deviceInfo) {
   const map = modelLogins || await loadModelLogins();
   const model = u.model || '';
   const count = model && map && typeof map === 'object' ? (Number(map[model]) || 0) : 0;
-  const out = { id: u.id || '', email: u.email, name: u.name || '', firstName: u.firstName || '', lastName: u.lastName || '', address: u.address || '', credits: u.credits, songCredits: u.songCredits, balance: Math.round(numOr(u.balance, 0) * 100) / 100, earnBalance: Math.round(numOr(u.earnBalance, 0) * 100) / 100, plan: u.plan || '', planExpiresAt: u.planExpiresAt || '', songPlan: u.songPlan || '', songPlanExpiresAt: u.songPlanExpiresAt || '', freeDlUsed: featureFreeUsed(u, 'freeDlUsed'), freeMvUsed: featureFreeUsed(u, 'freeMvUsed'), freeVsUsed: featureFreeUsed(u, 'freeVsUsed'), freePostUsed: featureFreeUsed(u, 'freePostUsed'), freePostUsedByType: freePostUsedByType(u), mvLeft: featurePkgLeft(u, 'mvLeft'), vsLeft: featurePkgLeft(u, 'vsLeft'), mvUnlimited: !!u.mvUnlimited, vsUnlimited: !!u.vsUnlimited, bonusDl: featureBonus(u, 'bonusDl'), bonusMv: featureBonus(u, 'bonusMv'), bonusVs: featureBonus(u, 'bonusVs'), bonusPostByType: bonusPostByType(u), createdAt: u.createdAt, updatedAt: u.updatedAt, lastIp: u.lastIp || '', country: u.country || '', countryCode: u.countryCode || '', device: u.device || '', model, modelLogins: count, lastSeen: u.lastSeen || '', knownDevices: Array.isArray(u.knownDevices) ? u.knownDevices : [], hasPassword: !!(u.passwordHash && u.passwordSalt),
+  const out = { id: u.id || '', email: u.email, name: u.name || '', firstName: u.firstName || '', lastName: u.lastName || '', address: u.address || '', credits: u.credits, songCredits: u.songCredits, balance: Math.round(numOr(u.balance, 0) * 100) / 100, earnBalance: Math.round(numOr(u.earnBalance, 0) * 100) / 100, plan: u.plan || '', planExpiresAt: u.planExpiresAt || '', songPlan: u.songPlan || '', songPlanExpiresAt: u.songPlanExpiresAt || '', freeDlUsed: featureFreeUsed(u, 'freeDlUsed'), freeMvUsed: featureFreeUsed(u, 'freeMvUsed'), freeVsUsed: featureFreeUsed(u, 'freeVsUsed'), freePostUsed: featureFreeUsed(u, 'freePostUsed'), freePostUsedByType: freePostUsedByType(u), mvLeft: featurePkgLeft(u, 'mvLeft'), vsLeft: featurePkgLeft(u, 'vsLeft'), mvUnlimited: !!u.mvUnlimited, vsUnlimited: !!u.vsUnlimited, bonusDl: featureBonus(u, 'bonusDl'), bonusMv: featureBonus(u, 'bonusMv'), bonusVs: featureBonus(u, 'bonusVs'), bonusPostByType: bonusPostByType(u), createdAt: u.createdAt, updatedAt: u.updatedAt, lastIp: u.lastIp || '', country: u.country || '', countryCode: u.countryCode || '', device: u.device || '', model, modelLogins: count, lastSeen: u.lastSeen || '', knownDevices: Array.isArray(u.knownDevices) ? u.knownDevices : [], hasPassword: !!(u.passwordHash && u.passwordSalt), resetPending: !!u.resetPending,
     // Device fingerprint (anti-abuse): the device the account was
     // registered on (deviceId, never overwritten by later sign-ins from
     // other devices), the most recent device seen, and the model the
@@ -10119,6 +10119,7 @@ async function apiRoute(req, res, urlPath) {
       const hp = await hashPassword(password);
       u.passwordSalt = hp.salt;
       u.passwordHash = hp.hash;
+      u.resetPending = false;
       // Record the registration device + this sighting.
       if (_fp.deviceId) {
         if (!u.deviceId) u.deviceId = _fp.deviceId;
@@ -10362,6 +10363,7 @@ async function apiRoute(req, res, urlPath) {
       const hp = await hashPassword(password);
       u.passwordSalt = hp.salt;
       u.passwordHash = hp.hash;
+      u.resetPending = false;
       revokeAllRememberTokens(u);
       signinClear(email);
       const now = new Date().toISOString();
@@ -10734,6 +10736,7 @@ async function apiRoute(req, res, urlPath) {
         if (!u || typeof u !== 'object') continue;
         u.passwordHash = null;
         u.passwordSalt = null;
+        u.resetPending = true;
         u.updatedAt = now;
         try { revokeAllRememberTokens(u); } catch (e) {}
         n++;
@@ -10744,6 +10747,13 @@ async function apiRoute(req, res, urlPath) {
       return sendJSON(res, 200, { ok: true, resetAt: now, usersAffected: n });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
+  }
+  // GET /api/public/reset-state — PUBLIC, cheap. Open pages poll this
+  // (every 60s + when the tab becomes visible) so a Reset kicks the user
+  // out promptly instead of only on the next page load / sync.
+  if (req.method === 'GET' && urlPath === '/api/public/reset-state') {
+    const _fr = (await loadSettings()).forceReRegisterAt || '';
+    return sendJSON(res, 200, { ok: true, forceReRegisterAt: _fr });
   }
   // GET /api/public/device/pin-delete-status?deviceId=... — PUBLIC. The
   // sign-in page polls this after the user paid $0.25 to delete a forgotten
@@ -13104,6 +13114,7 @@ async function apiRoute(req, res, urlPath) {
       const hp = await hashPassword(password);
       u.passwordSalt = hp.salt;
       u.passwordHash = hp.hash;
+      u.resetPending = false;
       revokeAllRememberTokens(u);
       signinClear(email);
       const now = new Date().toISOString();
