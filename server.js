@@ -14766,7 +14766,7 @@ async function apiRoute(req, res, urlPath) {
   // the page's proportional fallback time is NOT ported: an invented
   // time is worse than a missing one, and Manual Sync fixes the flag.
   function mvScanNormTok(t) { return String(t || '').toLowerCase().replace(/[^\u1780-\u17FFa-z0-9]/g, ''); }
-  function mvScanIsStageDir(s) { if (!/^\([^)]*\)$/.test(s)) return false; return /(intro|verse|chorus|pre-chorus|bridge|outro|interlude|hook|refrain|instrumental|solo|\u179f\u17c6\u17a1\u17c1\u1784|\u1785\u17d2\u179a\u17c0\u1784|\u178f\u1793\u17d2\u178f\u17d2\u179a\u17b8)/i.test(s); }
+  function mvScanIsStageDir(s) { s = String(s || '').replace(/^\u200B+/, ''); if (!/^\([^)]*\)$/.test(s)) return false; return /(intro|verse|chorus|pre-chorus|bridge|outro|interlude|hook|refrain|instrumental|solo|\u179f\u17c6\u17a1\u17c1\u1784|\u1785\u17d2\u179a\u17c0\u1784|\u178f\u1793\u17d2\u178f\u17d2\u179a\u17b8)/i.test(s); }
   function mvScanTextLines(text) { return String(text || '').split(/\r?\n/).map(function (x) { return x.replace(/^\s+|\s+$/g, ''); }).filter(function (x) { return x && !/^\[[^\]]*\]$/.test(x) && !mvScanIsStageDir(x); }); }
   function mvScanWords(wlines) {
     const out = [];
@@ -14853,6 +14853,114 @@ async function apiRoute(req, res, urlPath) {
     }
     return { matched: matched, total: lines.length, singingStart: singingStart, lines: out };
   }
+  // ---- KFA-first Auto Scan (Khmer forced alignment, 2026-11-25) ----
+  // The KFA prototype timed 29/29 singable lines on a real Khmer song
+  // ("ជីវិតកូនអ្នកស្រែ") where Groq Whisper scored 0/37, so the
+  // endpoint prefers KFA word timings when they are available and
+  // falls back to Whisper (unchanged) when they are not. KFA aligns
+  // the GIVEN lyrics (forced alignment), so its words are an ORDERED
+  // stream: each lyric line is a contiguous run of KFA words. Do NOT
+  // route KFA words through mvScanAlignLines — it splits Khmer lines
+  // on whitespace (Khmer has no spaces, so each line is one giant
+  // token) and produces mostly wrong matches. The direct segmentation
+  // below is a faithful port of the prototype's verify_kfa.py: it
+  // walks the KFA word list in order and assigns each line its
+  // contiguous run (line start = first word's start, line end = last
+  // word's end). A line whose KFA words do not FULLY cover its text
+  // gets NO time (null) — never an invented time. Stage-direction
+  // lines never reach KFA (mvScanTextLines excludes them), so they can
+  // never get a forced timing.
+  function mvScanSegmentKfa(lines, kfaWords) {
+    const out = lines.map(function (L) { return { text: L.text, start: null, end: null, words: null, matched: false }; });
+    const words = Array.isArray(kfaWords) ? kfaWords : [];
+    if (!words.length) return { matched: 0, total: lines.length, singingStart: null, lines: out };
+    let pos = 0, matched = 0, singingStart = null;
+    for (let i = 0; i < lines.length; i++) {
+      const text = String(lines[i].text || '');
+      const lineNorm = mvScanNormTok(text);
+      if (!lineNorm) continue;
+      // Map each normalized char back to its raw index in the original
+      // line so each KFA word's `t` is an exact slice of the original
+      // lyric text (never a KFA/Whisper-invented word).
+      const rawIdx = [];
+      for (let c = 0; c < text.length; c++) { if (mvScanNormTok(text[c])) rawIdx.push(c); }
+      let consumed = '', used = [];
+      while (pos < words.length && consumed.length < lineNorm.length) {
+        const w = words[pos] || {};
+        const wn = mvScanNormTok(w.word || w.text || w.token || '');
+        if (!wn) { pos++; continue; }
+        if (lineNorm.indexOf(consumed + wn) === 0) { consumed += wn; used.push(pos); pos++; }
+        else if (consumed && lineNorm.slice(consumed.length).indexOf(wn[0]) === 0) break;
+        else break;
+      }
+      if (!used.length || consumed !== lineNorm) continue;
+      // KFA yields stretched segment times (start/end): the FIRST word
+      // of the stream always starts at 0.0 (a segment-boundary artefact
+      // — on the 29-line run the first sung word "តើ" got start 0.0
+      // while it is really sung at 14.00s) and word ends overextend
+      // into the gaps before the next line (up to ~4.2s on this song).
+      // actual_start / actual_end are the true trellis times, so they
+      // are the line and word boundaries. Fall back to start/end when
+      // actual_* is absent (e.g. a KFA service that only sends start/end).
+      const kfaStart = function (w) { return (typeof w.actual_start === 'number') ? w.actual_start : w.start; };
+      const kfaEnd = function (w) { return (typeof w.actual_end === 'number') ? w.actual_end : w.end; };
+      const first = words[used[0]], last = words[used[used.length - 1]];
+      const fS = kfaStart(first), lE = kfaEnd(last);
+      if (typeof fS !== 'number' || typeof lE !== 'number' || lE <= fS) continue;
+      let clen = 0; const wout = [];
+      for (let k = 0; k < used.length; k++) {
+        const w = words[used[k]] || {};
+        const wn = mvScanNormTok(w.word || w.text || w.token || '');
+        const rs = rawIdx[clen], re = rawIdx[clen + wn.length - 1];
+        const wS = kfaStart(w), wE = kfaEnd(w);
+        wout.push({ t: (typeof rs === 'number' && typeof re === 'number') ? text.slice(rs, re + 1) : (w.word || ''), start: wS, end: (typeof wE === 'number' && wE > wS) ? wE : wS + 0.2 });
+        clen += wn.length;
+      }
+      out[i].start = fS;
+      out[i].end = lE;
+      out[i].words = wout;
+      out[i].matched = true;
+      matched++;
+      if (singingStart === null && !mvScanIsStageDir(text)) singingStart = fS;
+    }
+    return { matched: matched, total: lines.length, singingStart: singingStart, lines: out };
+  }
+  // KFA word timings [{word, start, end, score}] or null.
+  // Sources, in order: (1) local test file KFA_WORDS_FILE (JSON
+  // {words:[...]} or a plain words array) — for local testing only;
+  // (2) the KFA service at KFA_ENDPOINT_URL (POST {audioUrl, lyrics,
+  // language} -> {ok, words:[...]}). Unset / unreachable / invalid =
+  // null, and the caller falls back to Whisper. The KFA service does
+  // not exist yet; until it does, KFA_ENDPOINT_URL is unset and every
+  // scan uses Whisper exactly as before. The typeof guards keep this
+  // safe to extract into a sandbox (the auto-scan tests run these
+  // functions in a vm context without process/fetch/fs).
+  async function mvScanKfaWords(audioUrl, lineTexts, lang) {
+    const env = (typeof process !== 'undefined' && process && process.env) ? process.env : {};
+    const file = String(env.KFA_WORDS_FILE || '').trim();
+    if (file) {
+      try {
+        const fsMod = (typeof fs !== 'undefined') ? fs : ((typeof require === 'function') ? require('fs') : null);
+        if (!fsMod) return null;
+        const raw = JSON.parse(fsMod.readFileSync(file, 'utf8'));
+        const arr = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.words) ? raw.words : null);
+        if (arr && arr.length) return arr;
+      } catch (e) {}
+      return null;
+    }
+    const ep = String(env.KFA_ENDPOINT_URL || '').trim().replace(/\/+$/, '');
+    if (!ep || typeof fetch !== 'function') return null;
+    try {
+      const fOpts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ audioUrl: audioUrl, lyrics: lineTexts.join('\n'), language: lang || '' }) };
+      if (typeof AbortSignal !== 'undefined' && AbortSignal && typeof AbortSignal.timeout === 'function') fOpts.signal = AbortSignal.timeout(300000);
+      const r = await fetch(ep, fOpts);
+      if (!r || !r.ok) return null;
+      const j = await r.json();
+      const arr = j && Array.isArray(j.words) ? j.words : null;
+      if (!arr || !arr.length) return null;
+      return arr;
+    } catch (e) { return null; }
+  }
 
   if (req.method === 'POST' && urlPath === '/api/mv/lyrics') {
     readJSONBody(req, 64 * 1024).then(async (body) => {
@@ -14915,7 +15023,9 @@ async function apiRoute(req, res, urlPath) {
 
   // POST /api/mv/auto-scan — PUBLIC. {email, url, lyrics, language, transcribeUrl?}.
   // Auto Scan helper for the MV Generator (owner order 2026-11-25):
-  // Groq Whisper word timings + the server-side lyric matcher above.
+  // KFA-first (Khmer forced alignment) with a Groq Whisper fallback:
+  // KFA word timings + direct segmentation below, else Whisper word
+  // timings + the server-side lyric matcher above.
   // The lyrics text is NEVER changed and NEVER comes from Whisper —
   // only the TIMING is attached to the exact original lines. Unmatched
   // lines get start/end null (never a guessed time) so Manual Sync can
@@ -14968,20 +15078,35 @@ async function apiRoute(req, res, urlPath) {
       // Khmer (same detection as the MV page); else auto-detect.
       const langReq2 = body && typeof body.language === 'string' ? body.language.trim().toLowerCase() : '';
       const lang2 = /^[a-z]{2,3}$/.test(langReq2) ? langReq2 : (/[\u1780-\u17FF]/.test(lyrics) ? 'km' : '');
-      let tr2;
-      try {
-        tr2 = await mvLyricsTranscribeSong(transcribeUrl || audioUrl, lang2);
-      } catch (e) {
-        if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Groq API Key ទេ · Admin has not set a Groq API Key yet' });
-        return sendJSON(res, 200, { ok: false, error: 'ស្ដាប់បទចម្រៀងមិនបាន (Whisper) · Could not transcribe the song (Whisper)' });
+      // KFA-first: try the Khmer forced aligner — it aligns the GIVEN
+      // lyrics, so it times real Khmer singing where Whisper returns
+      // garbage (prototype: 29/29 vs 0/37). Stage-dir lines never
+      // reach KFA (lineTexts already excludes them), so they can never
+      // get a forced timing. Whisper fallback: when KFA is unavailable
+      // or matches nothing, the previous Whisper path runs unchanged.
+      let res2 = null;
+      let language = lang2 || '';
+      const kfaWords = await mvScanKfaWords(transcribeUrl || audioUrl, lineTexts, lang2);
+      if (kfaWords && kfaWords.length) {
+        res2 = mvScanSegmentKfa(lineTexts.map(function (t) { return { text: t }; }), kfaWords);
       }
-      if (!tr2 || !tr2.ok || !tr2.lyrics || !tr2.lyrics.length) {
-        return sendJSON(res, 200, { ok: false, error: 'រកមិនឃើញអត្ថបទចម្រៀងក្នុងបទនេះទេ · No lyrics were found in this song' });
+      if (!res2 || !res2.matched) {
+        let tr2;
+        try {
+          tr2 = await mvLyricsTranscribeSong(transcribeUrl || audioUrl, lang2);
+        } catch (e) {
+          if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Groq API Key ទេ · Admin has not set a Groq API Key yet' });
+          return sendJSON(res, 200, { ok: false, error: 'ស្ដាប់បទចម្រៀងមិនបាន (Whisper) · Could not transcribe the song (Whisper)' });
+        }
+        if (!tr2 || !tr2.ok || !tr2.lyrics || !tr2.lyrics.length) {
+          return sendJSON(res, 200, { ok: false, error: 'រកមិនឃើញអត្ថបទចម្រៀងក្នុងបទនេះទេ · No lyrics were found in this song' });
+        }
+        res2 = mvScanAlignLines(lineTexts.map(function (t) { return { text: t }; }), tr2.lyrics);
+        language = tr2.language || lang2 || '';
       }
-      const res2 = mvScanAlignLines(lineTexts.map(function (t) { return { text: t }; }), tr2.lyrics);
       const unmatched = [];
       res2.lines.forEach(function (L, idx) { if (!L.matched) unmatched.push(idx); });
-      const autoScan = { lines: res2.lines, singingStart: res2.singingStart, scannedAt: new Date().toISOString(), language: tr2.language || lang2 || '' };
+      const autoScan = { lines: res2.lines, singingStart: res2.singingStart, scannedAt: new Date().toISOString(), language: language };
       // Store on the song's history item (same store + key as the
       // POST /api/public/history merge: by id, else by url). Best
       // effort — a store failure must not fail the scan result.
@@ -14997,7 +15122,7 @@ async function apiRoute(req, res, urlPath) {
           }
         } catch (e) {}
       }
-      return sendJSON(res, 200, { ok: true, language: tr2.language || lang2 || '', lines: res2.lines, singingStart: res2.singingStart, matched: res2.matched, total: res2.total, unmatched: unmatched });
+      return sendJSON(res, 200, { ok: true, language: language, lines: res2.lines, singingStart: res2.singingStart, matched: res2.matched, total: res2.total, unmatched: unmatched });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
