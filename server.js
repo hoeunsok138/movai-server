@@ -14913,7 +14913,7 @@ async function apiRoute(req, res, urlPath) {
     return;
   }
 
-  // POST /api/mv/auto-scan — PUBLIC. {email, url, lyrics, language}.
+  // POST /api/mv/auto-scan — PUBLIC. {email, url, lyrics, language, transcribeUrl?}.
   // Auto Scan helper for the MV Generator (owner order 2026-11-25):
   // Groq Whisper word timings + the server-side lyric matcher above.
   // The lyrics text is NEVER changed and NEVER comes from Whisper —
@@ -14922,6 +14922,12 @@ async function apiRoute(req, res, urlPath) {
   // fix them. Same mvLocked gate as /api/mv/lyrics. The result is also
   // stored on the song's history item (field `autoScan`) via the same
   // history store/merge so it survives reloads.
+  // Vocals-first (owner order 2026-11-25): the client may pass
+  // `transcribeUrl` — the separated vocals stem URL that Whisper
+  // should listen to (Whisper hallucinates on the full music mix, so
+  // it listens to the vocals-only stem instead). History is still
+  // matched/stored by `url` (the ORIGINAL song). The vocals stem is
+  // TIMING ONLY — it never becomes the song's audio.
   if (req.method === 'POST' && urlPath === '/api/mv/auto-scan') {
     readJSONBody(req, 512 * 1024).then(async (body) => {
       const _fs2 = await featureSettingsLoad();
@@ -14935,6 +14941,16 @@ async function apiRoute(req, res, urlPath) {
       try { u2 = new URL(audioUrl); } catch (e) { u2 = null; }
       if (!u2 || (u2.protocol !== 'http:' && u2.protocol !== 'https:') || audioUrl.length > 2000) {
         return sendJSON(res, 200, { ok: false, error: 'សូមដាក់លីងបទចម្រៀងត្រឹមត្រូវ · Please provide a valid song audio URL' });
+      }
+      // Vocals-first: an optional vocals stem URL for Whisper to listen
+      // to. Validated like the song URL; history still keys on `url`.
+      const transcribeUrl = body && typeof body.transcribeUrl === 'string' ? body.transcribeUrl.trim() : '';
+      if (transcribeUrl) {
+        let u3;
+        try { u3 = new URL(transcribeUrl); } catch (e) { u3 = null; }
+        if (!u3 || (u3.protocol !== 'http:' && u3.protocol !== 'https:') || transcribeUrl.length > 2000) {
+          return sendJSON(res, 200, { ok: false, error: 'សូមដាក់លីងសំឡេងច្រៀងត្រឹមត្រូវ · Please provide a valid vocals audio URL' });
+        }
       }
       // Lyrics source: the given lyrics; else the song's stored lyrics /
       // prompt from history; else nothing to align.
@@ -14954,7 +14970,7 @@ async function apiRoute(req, res, urlPath) {
       const lang2 = /^[a-z]{2,3}$/.test(langReq2) ? langReq2 : (/[\u1780-\u17FF]/.test(lyrics) ? 'km' : '');
       let tr2;
       try {
-        tr2 = await mvLyricsTranscribeSong(audioUrl, lang2);
+        tr2 = await mvLyricsTranscribeSong(transcribeUrl || audioUrl, lang2);
       } catch (e) {
         if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Groq API Key ទេ · Admin has not set a Groq API Key yet' });
         return sendJSON(res, 200, { ok: false, error: 'ស្ដាប់បទចម្រៀងមិនបាន (Whisper) · Could not transcribe the song (Whisper)' });
