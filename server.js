@@ -10062,7 +10062,8 @@ async function apiRoute(req, res, urlPath) {
       const _devSlots = Math.floor(numOr(_devRec.rec && _devRec.rec.slots, 0));
       const _devAccounts = deviceAccountsCount(users, _fp);
       const _devLimit = Math.min(_devDl.limit + _devSlots, _devDl.maxAccounts);
-      return sendJSON(res, 200, { ok: true, user: await pubUser(u, _modelLogins), device: { accounts: _devAccounts, slots: _devSlots, limit: _devLimit, freeLimit: _devDl.limit, maxAccounts: _devDl.maxAccounts, slotPrice: _devDl.slotPrice, limitReached: _devAccounts >= _devLimit } });
+      const _frAt = (await loadSettings()).forceReRegisterAt || '';
+      return sendJSON(res, 200, { ok: true, user: await pubUser(u, _modelLogins), forceReRegisterAt: _frAt, device: { accounts: _devAccounts, slots: _devSlots, limit: _devLimit, freeLimit: _devDl.limit, maxAccounts: _devDl.maxAccounts, slotPrice: _devDl.slotPrice, limitReached: _devAccounts >= _devLimit } });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
@@ -10379,7 +10380,8 @@ async function apiRoute(req, res, urlPath) {
     if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
     const users = await loadUsers();
     const modelLogins = await loadModelLogins();
-    const list = await Promise.all(Object.values(users).sort((x, y) => String(y.createdAt || '').localeCompare(String(x.createdAt || ''))).map(async (x) => pubUser(x, modelLogins, await deviceInfoForUser(users, x))));
+    const _buyers = await buyerEmailSet();
+    const list = await Promise.all(Object.values(users).sort((x, y) => String(y.createdAt || '').localeCompare(String(x.createdAt || ''))).map(async (x) => { const _pu = await pubUser(x, modelLogins, await deviceInfoForUser(users, x)); _pu.hasPurchase = _buyers.has(String(_pu.email || '').toLowerCase()); return _pu; }));
     return sendJSON(res, 200, { ok: true, users: list });
   }
   // GET /api/admin/user?email=... — admin key required.
@@ -10391,7 +10393,9 @@ async function apiRoute(req, res, urlPath) {
     const _allUsers = await loadUsers();
     const u = _allUsers[email];
     if (!u) return sendJSON(res, 200, { ok: false, error: 'រកអ្នកប្រើនេះមិនឃើញទេ' });
-    return sendJSON(res, 200, { ok: true, user: await pubUser(u, null, await deviceInfoForUser(_allUsers, u)) });
+    const _one = await pubUser(u, null, await deviceInfoForUser(_allUsers, u));
+    _one.hasPurchase = (await buyerEmailSet()).has(String(_one.email || '').toLowerCase());
+    return sendJSON(res, 200, { ok: true, user: _one });
   }
   // GET /api/admin/email-usage — admin key required. Live Brevo usage
   // for the Admin → Settings → Email panel: plan (Free), daily limit
@@ -10708,6 +10712,51 @@ async function apiRoute(req, res, urlPath) {
       return sendJSON(res, 200, { ok: true, fingerprint: fp, slots: slots, deviceLimit: Math.min(dl.limit + slots, dl.maxAccounts), deviceAccounts: accounts, maxAccounts: dl.maxAccounts });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
+  }
+  // POST /api/admin/reset-signin — admin key required. Owner order
+  // 2026-11-25 ("Reset Create Account Sign-in"): log EVERY user out at once
+  // and force re-registration — on next sign-in each user must set a MovAi
+  // password (twice + Create) and is asked about the 6-digit hide PIN.
+  // DATA IS NOT DELETED: accounts, songs, credits and history stay as they
+  // are; only passwords + remember tokens are cleared, and
+  // settings.forceReRegisterAt is set so clients drop sessions that predate
+  // the reset. The Admin taps this once; the website enforces it on the
+  // next sync (refreshProfile / giftInit).
+  if (req.method === 'POST' && urlPath === '/api/admin/reset-signin') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async () => {
+      const now = new Date().toISOString();
+      const users = await loadUsers();
+      let n = 0;
+      for (const em of Object.keys(users)) {
+        const u = users[em];
+        if (!u || typeof u !== 'object') continue;
+        u.passwordHash = null;
+        u.passwordSalt = null;
+        u.updatedAt = now;
+        try { revokeAllRememberTokens(u); } catch (e) {}
+        n++;
+      }
+      await saveUsers(users);
+      scheduleBackup('users.json');
+      await saveSettings(Object.assign(await loadSettings(), { forceReRegisterAt: now }));
+      return sendJSON(res, 200, { ok: true, resetAt: now, usersAffected: n });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  // GET /api/public/device/pin-delete-status?deviceId=... — PUBLIC. The
+  // sign-in page polls this after the user paid $0.25 to delete a forgotten
+  // 6-digit hide PIN: when the Admin approves the pin-delete request the
+  // client deletes the device-local PIN + lockout and can set a new code.
+  // The PIN is per-device, so the check is by device fingerprint only.
+  if (req.method === 'GET' && urlPath === '/api/public/device/pin-delete-status') {
+    const pdDid = deviceCleanId(new URL(req.url, 'http://localhost').searchParams.get('deviceId') || '');
+    if (!pdDid) return sendJSON(res, 200, { ok: true, approved: false });
+    const pdReqs = await loadPurchaseRequests();
+    const pdLatest = pdReqs.filter((x) => x && x.kind === 'pin-delete' && x.status === 'approved' && String(x.fingerprint || '') === 'id:' + pdDid).sort((x, y) => String(y.decidedAt || y.updatedAt || '').localeCompare(String(x.decidedAt || x.updatedAt || '')))[0];
+    if (!pdLatest) return sendJSON(res, 200, { ok: true, approved: false });
+    return sendJSON(res, 200, { ok: true, approved: true, requestId: pdLatest.id, approvedAt: pdLatest.decidedAt || pdLatest.updatedAt || '' });
   }
   // GET /api/public/device/accounts?deviceId=... — PUBLIC. The device's own
   // registered Gmails, for the sign-in page list (which Gmails this device
@@ -12437,6 +12486,13 @@ async function apiRoute(req, res, urlPath) {
   async function savePurchaseRequests(arr) {
     await saveKvDoc('purchase-requests', arr, 'purchase-requests.json');
   }
+  // Emails with ANY approved purchase request (package, device-slot,
+  // discount, pin-delete or song-sale) — used by the Admin users list so a
+  // buyer is never shown as "Free" (owner order 2026-11-25).
+  async function buyerEmailSet() {
+    const _br = await loadPurchaseRequests();
+    return new Set(_br.filter((x) => x && x.status === 'approved' && x.email).map((x) => String(x.email).toLowerCase()));
+  }
   function newPurchaseId() {
     return 'pr_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
@@ -12450,12 +12506,32 @@ async function apiRoute(req, res, urlPath) {
       const _m = typeof body.method === 'string' ? body.method.trim().toLowerCase() : '';
       const payMethod = _m === 'khqr' || _m === 'usdt' ? _m : '';
       let packageId = '', pkg = null, feature = '', postType = '', discLabel = '', dsSlotPrice = 0, dsFingerprint = '';
+      const reqs = await loadPurchaseRequests();
       if (kind === 'discount') {
         feature = typeof body.feature === 'string' ? body.feature.trim().toLowerCase() : '';
         if (DISCOUNT_FEATURES.indexOf(feature) < 0) return sendJSON(res, 200, { ok: false, error: 'សូមជ្រើសរើស Feature ត្រឹមត្រូវ' });
         postType = feature === 'post' ? postTypeOf('', body.postType) : '';
         packageId = 'discount:' + feature + (postType ? ':' + postType : '');
         discLabel = 'Discount 4× ' + (feature === 'post' ? 'Post' : feature === 'download' ? 'Download' : feature === 'mv' ? 'MV' : 'Vocal Studio') + (postType ? ' (' + postType + ')' : '');
+      } else if (kind === 'pin-delete') {
+        // Delete a forgotten 6-digit hide PIN — $0.25 per time (owner order
+        // 2026-11-25). The PIN is device-local (localStorage); paying does
+        // not delete it directly — the Admin approves and the client sees
+        // the approval via /api/public/device/pin-delete-status and deletes
+        // it. Same fingerprint + 24h one-request rule as device-slot.
+        const pdDl = await deviceLimitSetting();
+        const pdRaw = typeof body.fingerprint === 'string' ? body.fingerprint.trim().slice(0, 80) : '';
+        const pdFp = pdRaw.indexOf('id:') === 0 ? pdRaw : (pdRaw ? 'id:' + deviceCleanId(pdRaw) : '');
+        if (!pdFp) return sendJSON(res, 200, { ok: false, error: 'រកឧបករណ៍នេះមិនឃើញទេ · Device fingerprint required' });
+        const pdAll = await loadDeviceRecords();
+        const pdRec = pdAll[pdFp];
+        if (!pdRec || typeof pdRec !== 'object') return sendJSON(res, 200, { ok: false, error: 'រកឧបករណ៍នេះមិនឃើញទេ · Device not found' });
+        if (pdRec.blocked) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះត្រូវបានប្លុក — សូមទាក់ទង Admin · This device is blocked — please contact the Admin' });
+        const pdDup = reqs.some((x) => x && x.kind === 'pin-delete' && String(x.email || '').toLowerCase() === email && String(x.fingerprint || '') === pdFp && (x.status === 'pending' || x.status === 'rejected') && (Date.now() - new Date(x.createdAt || 0).getTime()) < 86400000);
+        if (pdDup) return sendJSON(res, 200, { ok: false, error: 'អ្នកធ្លាប់ផ្ញើសំណើរលុបលេខកូដនេះម្តងហើយ — សូមរង់ចាំ 24 ម៉ោង ទើបអាចផ្ញើម្ដងទៀតបាន · You already sent this delete request once — please wait 24 hours before sending again', alreadySent: true });
+        packageId = 'pin-delete';
+        dsSlotPrice = 0.25;
+        dsFingerprint = pdFp;
       } else if (kind === 'device-slot') {
         // Gmail-slot purchase (sign-in Upgrade popup): 1 extra Gmail on THIS
         // device, slot price from settings (default $0.99). No package; the
@@ -12485,16 +12561,15 @@ async function apiRoute(req, res, urlPath) {
         if (!pkg) return sendJSON(res, 200, { ok: false, error: 'កញ្ចប់នេះមិនស្គាល់ទេ' });
       }
       const now = new Date().toISOString();
-      const reqs = await loadPurchaseRequests();
       const r = {
         id: newPurchaseId(), email, packageId, method: payMethod,
-        kind: kind === 'device-slot' ? 'device-slot' : (kind === 'discount' ? 'discount' : 'package'),
+        kind: kind === 'device-slot' ? 'device-slot' : (kind === 'pin-delete' ? 'pin-delete' : (kind === 'discount' ? 'discount' : 'package')),
         feature: kind === 'discount' ? feature : '',
         postType: kind === 'discount' ? postType : '',
-        plan: kind === 'device-slot' ? 'Gmail Slot · 1 Gmail' : (kind === 'discount' ? discLabel : (typeof body.plan === 'string' ? body.plan.slice(0, 50) : packageId)),
-        amount: kind === 'device-slot' ? dsSlotPrice : (kind === 'discount' ? DISCOUNT_PACK[feature].price : pkg.price),
-        credits: kind === 'device-slot' ? 0 : (kind === 'discount' ? 0 : pkg.credits), songCredits: kind === 'device-slot' ? 0 : (kind === 'discount' ? 0 : pkg.songCredits), days: kind === 'device-slot' ? 0 : (kind === 'discount' ? 0 : pkg.days),
-        fingerprint: kind === 'device-slot' ? dsFingerprint : '',
+        plan: kind === 'device-slot' ? 'Gmail Slot · 1 Gmail' : (kind === 'pin-delete' ? 'Delete 6-digit PIN · លុបលេខកូដ 6 ខ្ទង់' : (kind === 'discount' ? discLabel : (typeof body.plan === 'string' ? body.plan.slice(0, 50) : packageId))),
+        amount: (kind === 'device-slot' || kind === 'pin-delete') ? dsSlotPrice : (kind === 'discount' ? DISCOUNT_PACK[feature].price : pkg.price),
+        credits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : pkg.credits), songCredits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : pkg.songCredits), days: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : pkg.days),
+        fingerprint: (kind === 'device-slot' || kind === 'pin-delete') ? dsFingerprint : '',
         receiptUrl: typeof body.receiptUrl === 'string' ? body.receiptUrl.trim().slice(0, 500) : '',
         status: 'pending', createdAt: now, updatedAt: now,
       };
@@ -12503,7 +12578,9 @@ async function apiRoute(req, res, urlPath) {
       await savePurchaseRequests(reqs);
       const _pu = (await loadUsers())[email];
       const _puid = _pu && _pu.id ? _pu.id : '—';
-      if (kind === 'device-slot') {
+      if (kind === 'pin-delete') {
+        await addNotification('purchase-request', email, '🛒 ស្នើលុបលេខកូដ 6 ខ្ទង់ · Delete 6-digit PIN request', email + ' · ID: ' + _puid + ' សុំលុបលេខកូដ 6 ខ្ទង់ តម្លៃ $0.25 (' + (payMethod === 'usdt' ? 'QR USDT' : 'KHQR') + ' — បានបង់ហើយ មានវិក្កយបត្រភ្ជាប់មក) · Wants to delete the 6-digit hide PIN', { extra: { pkg: packageId, pkgName: 'Delete 6-digit PIN · លុបលេខកូដ 6 ខ្ទង់', priceText: '$0.25', creditText: 'Delete PIN', buyerId: _puid, pinDelete: true, fingerprint: dsFingerprint } });
+      } else if (kind === 'device-slot') {
         await addNotification('purchase-request', email, '🛒 ស្នើទិញ Gmail Slot · Gmail slot purchase request', email + ' · ID: ' + _puid + ' សុំទិញ 1 Gmail បន្ថែម តម្លៃ $' + walletMoney(dsSlotPrice).toFixed(2) + ' (' + (payMethod === 'usdt' ? 'QR USDT' : 'KHQR') + ' — បានបង់ហើយ មានវិក្កយបត្រភ្ជាប់មក) · Wants 1 extra Gmail slot', { extra: { pkg: packageId, pkgName: 'Gmail Slot · 1 Gmail', priceText: '$' + walletMoney(dsSlotPrice).toFixed(2), creditText: '1 Gmail', buyerId: _puid, deviceSlot: true, fingerprint: dsFingerprint } });
       } else if (kind === 'discount') {
         await addNotification('purchase-request', email, '🛒 សំណើទិញ Discount · Discount purchase request', email + ' · ID: ' + _puid + ' សុំទិញ ' + discLabel + ' តម្លៃ $' + DISCOUNT_PACK[feature].price.toFixed(2) + ' (KHQR/USDT — បានបង់ហើយ មានវិក្កយបត្រភ្ជាប់មក)', { extra: { pkg: packageId, pkgName: discLabel, priceText: '$' + DISCOUNT_PACK[feature].price.toFixed(2), creditText: '4× ' + (feature === 'post' ? 'Post' : feature === 'download' ? 'Download' : feature === 'mv' ? 'MV' : 'Vocal Studio'), buyerId: _puid, discount: true, feature, postType } });
@@ -12606,6 +12683,21 @@ async function apiRoute(req, res, urlPath) {
         await addNotification('purchase-approved', r.email, '✅ បានអនុម័ត · Gmail slot approved', 'Gmail Slot 1 គណនី ($' + walletMoney(r.amount || 0).toFixed(2) + ') បានអនុម័ត — ឥឡូវ ' + r.email + ' អាចចូលប្រើបានហើយ · Your extra Gmail slot is approved — you can sign in now', { extra: { deviceSlot: true, fingerprint: dsFp2, decision: 'approved' } });
         await markPurchaseRequestDecided(r.email, r.packageId, 'approved', dsNow);
         return sendJSON(res, 200, { ok: true, request: r, slots: dsRec2.slots, deviceLimit: Math.min(dsDl2.limit + dsRec2.slots, dsDl2.maxAccounts) });
+      }
+      if (r.kind === 'pin-delete') {
+        // Delete-PIN approve: nothing to grant server-side (the PIN is
+        // device-local). Marking it approved is the signal — the client
+        // polls /api/public/device/pin-delete-status, deletes its local
+        // PIN + lockout, and can set a new code (or leave it off).
+        const pdNow = new Date().toISOString();
+        r.status = 'approved';
+        r.decidedAt = pdNow;
+        r.updatedAt = pdNow;
+        await savePurchaseRequests(reqs);
+        scheduleBackup('purchase-requests.json');
+        await addNotification('purchase-approved', r.email, '✅ បានអនុម័ត · PIN delete approved', 'ការលុបលេខកូដ 6 ខ្ទង់ ($0.25) បានអនុម័ត — ឥឡូវអ្នកអាចដាក់លេខកូដថ្មី ឬមិនដាក់ក៏បាន · Your 6-digit PIN delete is approved — you can set a new code or leave it off', { extra: { pinDelete: true, fingerprint: r.fingerprint || '', decision: 'approved' } });
+        await markPurchaseRequestDecided(r.email, r.packageId, 'approved', pdNow);
+        return sendJSON(res, 200, { ok: true, request: r });
       }
       const pkg = (r.kind === 'discount' || r.kind === 'song-sale' || r.type === 'song-sale') ? null : (await loadPackages())[r.packageId];
       if (!pkg && r.kind !== 'discount' && r.kind !== 'song-sale' && r.type !== 'song-sale') return sendJSON(res, 200, { ok: false, error: 'កញ្ចប់នេះមិនស្គាល់ទេ' });
