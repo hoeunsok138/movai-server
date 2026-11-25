@@ -10709,6 +10709,24 @@ async function apiRoute(req, res, urlPath) {
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
+  // GET /api/public/device/accounts?deviceId=... — PUBLIC. The device's own
+  // registered Gmails, for the sign-in page list (which Gmails this device
+  // already has, which are Pro, which Upgrade is pending). Fingerprint-
+  // scoped to the caller's own deviceId; no secrets. 'pro' = registered
+  // beyond the free limit (rec.emails is newest-first, so the first N are Pro).
+  if (req.method === 'GET' && urlPath === '/api/public/device/accounts') {
+    const daDid = deviceCleanId(new URL(req.url, 'http://localhost').searchParams.get('deviceId') || '');
+    const daDl = await deviceLimitSetting();
+    const daEmpty = { ok: true, emails: [], slots: 0, limit: daDl.limit, freeLimit: daDl.limit, maxAccounts: daDl.maxAccounts, deviceAccounts: 0 };
+    if (!daDid) return sendJSON(res, 200, daEmpty);
+    const daAll = await loadDeviceRecords();
+    const daRec = daAll['id:' + daDid];
+    if (!daRec || typeof daRec !== 'object') return sendJSON(res, 200, daEmpty);
+    const daEms = (Array.isArray(daRec.emails) ? daRec.emails : []).filter((e) => typeof e === 'string' && e.indexOf('@') > 0).slice(0, 10);
+    const daSlots = Math.floor(numOr(daRec.slots, 0));
+    const daProCount = Math.max(0, daEms.length - daDl.limit);
+    return sendJSON(res, 200, { ok: true, emails: daEms.map((e, i) => ({ email: e, pro: i < daProCount })), slots: daSlots, limit: Math.min(daDl.limit + daSlots, daDl.maxAccounts), freeLimit: daDl.limit, maxAccounts: daDl.maxAccounts, deviceAccounts: daEms.length });
+  }
   // GET /api/admin/gift-50 — admin key required. Reads the new-user
   // gift-50 toggle (default OFF). POST /api/admin/gift-50 {enabled}
   // sets it. When ON, a BRAND-NEW registrant who claims the gift gets
@@ -12425,13 +12443,29 @@ async function apiRoute(req, res, urlPath) {
       const kind = typeof body.kind === 'string' ? body.kind.trim().toLowerCase() : 'package';
       const _m = typeof body.method === 'string' ? body.method.trim().toLowerCase() : '';
       const payMethod = _m === 'khqr' || _m === 'usdt' ? _m : '';
-      let packageId = '', pkg = null, feature = '', postType = '', discLabel = '';
+      let packageId = '', pkg = null, feature = '', postType = '', discLabel = '', dsSlotPrice = 0, dsFingerprint = '';
       if (kind === 'discount') {
         feature = typeof body.feature === 'string' ? body.feature.trim().toLowerCase() : '';
         if (DISCOUNT_FEATURES.indexOf(feature) < 0) return sendJSON(res, 200, { ok: false, error: 'សូមជ្រើសរើស Feature ត្រឹមត្រូវ' });
         postType = feature === 'post' ? postTypeOf('', body.postType) : '';
         packageId = 'discount:' + feature + (postType ? ':' + postType : '');
         discLabel = 'Discount 4× ' + (feature === 'post' ? 'Post' : feature === 'download' ? 'Download' : feature === 'mv' ? 'MV' : 'Vocal Studio') + (postType ? ' (' + postType + ')' : '');
+      } else if (kind === 'device-slot') {
+        // Gmail-slot purchase (sign-in Upgrade popup): 1 extra Gmail on THIS
+        // device, slot price from settings (default $0.99). No package; the
+        // buyer has no user record yet (the gate refused registration).
+        const dsDl = await deviceLimitSetting();
+        const dsRaw = typeof body.fingerprint === 'string' ? body.fingerprint.trim().slice(0, 80) : '';
+        const dsFp = dsRaw.indexOf('id:') === 0 ? dsRaw : (dsRaw ? 'id:' + deviceCleanId(dsRaw) : '');
+        if (!dsFp) return sendJSON(res, 200, { ok: false, error: 'រកឧបករណ៍នេះមិនឃើញទេ · Device fingerprint required' });
+        const dsAll = await loadDeviceRecords();
+        const dsRec = dsAll[dsFp];
+        if (!dsRec || typeof dsRec !== 'object') return sendJSON(res, 200, { ok: false, error: 'រកឧបករណ៍នេះមិនឃើញទេ · Device not found' });
+        if (dsRec.blocked) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះត្រូវបានប្លុក — សូមទាក់ទង Admin · This device is blocked — please contact the Admin' });
+        if (Math.floor(numOr(dsRec.slots, 0)) >= Math.max(0, dsDl.maxAccounts - dsDl.limit)) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះមានគណនីច្រើនបំផុត ' + dsDl.maxAccounts + ' ហើយ · This device already has the maximum accounts' });
+        packageId = 'device-slot';
+        dsSlotPrice = dsDl.slotPrice;
+        dsFingerprint = dsFp;
       } else {
         packageId = typeof body.packageId === 'string' ? body.packageId.trim() : '';
         pkg = (await loadPackages())[packageId];
@@ -12441,12 +12475,13 @@ async function apiRoute(req, res, urlPath) {
       const reqs = await loadPurchaseRequests();
       const r = {
         id: newPurchaseId(), email, packageId, method: payMethod,
-        kind: kind === 'discount' ? 'discount' : 'package',
+        kind: kind === 'device-slot' ? 'device-slot' : (kind === 'discount' ? 'discount' : 'package'),
         feature: kind === 'discount' ? feature : '',
         postType: kind === 'discount' ? postType : '',
-        plan: kind === 'discount' ? discLabel : (typeof body.plan === 'string' ? body.plan.slice(0, 50) : packageId),
-        amount: kind === 'discount' ? DISCOUNT_PACK[feature].price : pkg.price,
-        credits: kind === 'discount' ? 0 : pkg.credits, songCredits: kind === 'discount' ? 0 : pkg.songCredits, days: kind === 'discount' ? 0 : pkg.days,
+        plan: kind === 'device-slot' ? 'Gmail Slot · 1 Gmail' : (kind === 'discount' ? discLabel : (typeof body.plan === 'string' ? body.plan.slice(0, 50) : packageId)),
+        amount: kind === 'device-slot' ? dsSlotPrice : (kind === 'discount' ? DISCOUNT_PACK[feature].price : pkg.price),
+        credits: kind === 'device-slot' ? 0 : (kind === 'discount' ? 0 : pkg.credits), songCredits: kind === 'device-slot' ? 0 : (kind === 'discount' ? 0 : pkg.songCredits), days: kind === 'device-slot' ? 0 : (kind === 'discount' ? 0 : pkg.days),
+        fingerprint: kind === 'device-slot' ? dsFingerprint : '',
         receiptUrl: typeof body.receiptUrl === 'string' ? body.receiptUrl.trim().slice(0, 500) : '',
         status: 'pending', createdAt: now, updatedAt: now,
       };
@@ -12455,7 +12490,9 @@ async function apiRoute(req, res, urlPath) {
       await savePurchaseRequests(reqs);
       const _pu = (await loadUsers())[email];
       const _puid = _pu && _pu.id ? _pu.id : '—';
-      if (kind === 'discount') {
+      if (kind === 'device-slot') {
+        await addNotification('purchase-request', email, '🛒 ស្នើទិញ Gmail Slot · Gmail slot purchase request', email + ' · ID: ' + _puid + ' សុំទិញ 1 Gmail បន្ថែម តម្លៃ $' + walletMoney(dsSlotPrice).toFixed(2) + ' (' + (payMethod === 'usdt' ? 'QR USDT' : 'KHQR') + ' — បានបង់ហើយ មានវិក្កយបត្រភ្ជាប់មក) · Wants 1 extra Gmail slot', { extra: { pkg: packageId, pkgName: 'Gmail Slot · 1 Gmail', priceText: '$' + walletMoney(dsSlotPrice).toFixed(2), creditText: '1 Gmail', buyerId: _puid, deviceSlot: true, fingerprint: dsFingerprint } });
+      } else if (kind === 'discount') {
         await addNotification('purchase-request', email, '🛒 សំណើទិញ Discount · Discount purchase request', email + ' · ID: ' + _puid + ' សុំទិញ ' + discLabel + ' តម្លៃ $' + DISCOUNT_PACK[feature].price.toFixed(2) + ' (KHQR/USDT — បានបង់ហើយ មានវិក្កយបត្រភ្ជាប់មក)', { extra: { pkg: packageId, pkgName: discLabel, priceText: '$' + DISCOUNT_PACK[feature].price.toFixed(2), creditText: '4× ' + (feature === 'post' ? 'Post' : feature === 'download' ? 'Download' : feature === 'mv' ? 'MV' : 'Vocal Studio'), buyerId: _puid, discount: true, feature, postType } });
       } else {
         const _pd = pkgDisplay(pkg);
@@ -12529,6 +12566,34 @@ async function apiRoute(req, res, urlPath) {
       const r = reqs.find((x) => x.id === id);
       if (!r) return sendJSON(res, 200, { ok: false, error: 'រកសំណើនេះមិនឃើញទេ' });
       if (r.status !== 'pending') return sendJSON(res, 200, { ok: false, error: 'សំណើនេះបានសម្រេចរួចហើយ' });
+      if (r.kind === 'device-slot') {
+        // Gmail-slot approve: grant +1 slot to the DEVICE (no user record
+        // needed — the Gmail has not registered yet; that is why it is
+        // buying a slot). After this the buyer taps Sign in with Google
+        // again and the gate lets the new Gmail in.
+        const dsNow = new Date().toISOString();
+        const dsFp2 = typeof r.fingerprint === 'string' ? r.fingerprint.trim() : '';
+        const dsAll2 = await loadDeviceRecords();
+        const dsRec2 = dsFp2 ? dsAll2[dsFp2] : null;
+        if (!dsRec2 || typeof dsRec2 !== 'object') return sendJSON(res, 200, { ok: false, error: 'រកឧបករណ៍នេះមិនឃើញទេ · Device not found' });
+        if (dsRec2.blocked) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះត្រូវបានប្លុក · This device is blocked' });
+        const dsDl2 = await deviceLimitSetting();
+        const dsOwned2 = Math.floor(numOr(dsRec2.slots, 0));
+        if (dsOwned2 >= Math.max(0, dsDl2.maxAccounts - dsDl2.limit)) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះមានគណនីច្រើនបំផុតហើយ · This device already has the maximum accounts' });
+        dsRec2.slots = dsOwned2 + 1;
+        dsRec2.strikes = 0;
+        dsRec2.lastSeen = dsNow;
+        await saveDeviceRecords(dsAll2);
+        scheduleBackup('device-records.json');
+        r.status = 'approved';
+        r.decidedAt = dsNow;
+        r.updatedAt = dsNow;
+        await savePurchaseRequests(reqs);
+        scheduleBackup('purchase-requests.json');
+        await addNotification('purchase-approved', r.email, '✅ បានអនុម័ត · Gmail slot approved', 'Gmail Slot 1 គណនី ($' + walletMoney(r.amount || 0).toFixed(2) + ') បានអនុម័ត — ឥឡូវ ' + r.email + ' អាចចូលប្រើបានហើយ · Your extra Gmail slot is approved — you can sign in now', { extra: { deviceSlot: true, fingerprint: dsFp2, decision: 'approved' } });
+        await markPurchaseRequestDecided(r.email, r.packageId, 'approved', dsNow);
+        return sendJSON(res, 200, { ok: true, request: r, slots: dsRec2.slots, deviceLimit: Math.min(dsDl2.limit + dsRec2.slots, dsDl2.maxAccounts) });
+      }
       const pkg = (r.kind === 'discount' || r.kind === 'song-sale' || r.type === 'song-sale') ? null : (await loadPackages())[r.packageId];
       if (!pkg && r.kind !== 'discount' && r.kind !== 'song-sale' && r.type !== 'song-sale') return sendJSON(res, 200, { ok: false, error: 'កញ្ចប់នេះមិនស្គាល់ទេ' });
       const users = await loadUsers();
