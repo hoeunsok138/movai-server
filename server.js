@@ -269,7 +269,7 @@ const GH_DATA_FILES = [
   'cloudinary-accounts.json', 'cloudinary-rotation.json', 'admin-key.json', 'mvsep-cache.json',
   'feature-usage.json', 'wallet-requests.json', 'device-records.json',
   'monetization-earnings.json', 'monetization-applications.json', 'creator-follows.json',
-  'deleted-items.json',
+  'deleted-items.json', 'api-keys.json', 'api-settings.json',
 ];
 const ghShaCache = {}; // filename -> GitHub blob sha (for PUT updates)
 function ghEnabled() { return !!GH_TOKEN; }
@@ -2548,6 +2548,181 @@ async function loadAdminKeys() {
 async function saveAdminKeys(k) {
   await saveKvDoc('admin-keys', k, 'admin-keys.json');
 }
+
+// ---- Public API keys ("Generate API Key") — owner order 2026-11-25 ----
+// External developers call MovAi's API with a key (movai_...). Storage:
+// kv_docs 'api-keys' (array of records). The FULL key value is returned
+// ONLY at creation / regeneration; every other read shows the masked
+// form (first 8 chars + '…' + last 4), same pattern as the admin-keys
+// values endpoint. API credits are SEPARATE from the app's Song Credits
+// and media credits — an API call never touches a user's app balance.
+// Costs (owner corrected 2026-11-25 15:05): 1 song generation = 12 API
+// credits and produces 2 songs (same 12 as the app's Suno generation);
+// images are FREE (0 credits, never deducted). A new API user gets a
+// one-time trial: 4 free images + 1 free song generation (2 songs),
+// tracked by flags, NOT by granted credits. After the 4 free images,
+// images need an active paid API package (imageRequiresPackage flag).
+// Video stays Coming Soon: POST /api/v1/videos answers
+// {ok:false, error:'video_not_available_yet'} and generates nothing.
+const API_PACKAGES = [
+  { id: 'api-5', price: 5, credits: 600 },
+  { id: 'api-10', price: 10, credits: 1200 },
+  { id: 'api-50', price: 50, credits: 8000 },
+  { id: 'api-500', price: 500, credits: 102000 },
+  { id: 'api-1250', price: 1250, credits: 255000 },
+];
+const API_PACKAGE_IDS = API_PACKAGES.map((p) => p.id);
+function apiPackageById(id) {
+  const s = typeof id === 'string' ? id.trim() : '';
+  return API_PACKAGES.find((p) => p.id === s) || null;
+}
+function apiPackagesPublic() {
+  return API_PACKAGES.map((p) => ({ id: p.id, price: p.price, credits: p.credits, perMonth: true }));
+}
+const DEFAULT_API_SETTINGS = { songCost: 12, imageCost: 0, videoCost: 50, videoPackagePrice: 0, imageRequiresPackage: true, freeImages: 4 };
+function apiSettingsClean(j) {
+  const v = (j && typeof j === 'object' && !Array.isArray(j)) ? j : {};
+  const cost = (x, d) => { const n = Math.floor(numOr(x, d)); return Number.isFinite(n) && n >= 0 ? n : d; };
+  return {
+    songCost: cost(v.songCost, DEFAULT_API_SETTINGS.songCost),
+    imageCost: 0, // images are FREE by owner order — never deducted, never a charge
+    videoCost: cost(v.videoCost, DEFAULT_API_SETTINGS.videoCost),
+    videoPackagePrice: cost(v.videoPackagePrice, DEFAULT_API_SETTINGS.videoPackagePrice),
+    imageRequiresPackage: v.imageRequiresPackage === undefined ? true : v.imageRequiresPackage === true,
+    freeImages: cost(v.freeImages, DEFAULT_API_SETTINGS.freeImages),
+  };
+}
+function apiKeyPrefixOf(key) { return typeof key === 'string' ? key.slice(0, 8) : ''; }
+function apiKeyMask(key) {
+  if (typeof key !== 'string' || key.length < 12) return '';
+  return key.slice(0, 8) + '…' + key.slice(-4);
+}
+function apiNewKeyValue() { return 'movai_' + crypto.randomBytes(24).toString('hex'); }
+function apiKeyPublic(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  const u = (rec.usage && typeof rec.usage === 'object') ? rec.usage : {};
+  return { id: rec.id || '', key: apiKeyMask(rec.key || ''), keyPrefix: rec.keyPrefix || apiKeyPrefixOf(rec.key || ''), email: rec.email || '', name: rec.name || '', credits: Math.max(0, Math.floor(numOr(rec.credits, 0))), package: rec.package || '', packageExpiresAt: rec.packageExpiresAt || '', freeImagesLeft: Math.max(0, Math.floor(numOr(rec.freeImagesLeft, 0))), freeSongTestUsed: rec.freeSongTestUsed === true, createdAt: rec.createdAt || '', lastUsedAt: rec.lastUsedAt || '', revoked: rec.revoked === true, usage: { songs: Math.max(0, Math.floor(numOr(u.songs, 0))), images: Math.max(0, Math.floor(numOr(u.images, 0))), videos: Math.max(0, Math.floor(numOr(u.videos, 0))), calls: Math.max(0, Math.floor(numOr(u.calls, 0))) } };
+}
+function apiKeyNewRecord(list, email, name, freeImages) {
+  const arr = Array.isArray(list) ? list : [];
+  const em = normEmail(email);
+  const siblings = arr.filter((x) => x && String(x.email || '').toLowerCase() === em);
+  const first = siblings.length === 0;
+  const fullKey = apiNewKeyValue();
+  const now = new Date().toISOString();
+  const record = { id: 'ak_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), key: fullKey, keyPrefix: apiKeyPrefixOf(fullKey), email: em, name: typeof name === 'string' ? name.trim().slice(0, 100) : '', credits: 0, package: '', packageExpiresAt: '', freeImagesLeft: first ? Math.max(0, Math.floor(numOr(freeImages, 4))) : 0, freeSongTestUsed: siblings.some((x) => x.freeSongTestUsed === true), createdAt: now, lastUsedAt: '', revoked: false, usage: { songs: 0, images: 0, videos: 0, calls: 0 } };
+  return { record, fullKey };
+}
+// The free-song test is per USER, not per key: using it on one key
+// marks every key of that user used; a failed generation unmarks it.
+function apiMarkFreeSongUsedForUser(list, email) {
+  const em = normEmail(email);
+  let n = 0;
+  for (const x of (Array.isArray(list) ? list : [])) {
+    if (x && String(x.email || '').toLowerCase() === em && x.freeSongTestUsed !== true) { x.freeSongTestUsed = true; n++; }
+  }
+  return n;
+}
+function apiUnmarkFreeSongUsedForUser(list, email) {
+  const em = normEmail(email);
+  let n = 0;
+  for (const x of (Array.isArray(list) ? list : [])) {
+    if (x && String(x.email || '').toLowerCase() === em && x.freeSongTestUsed === true) { x.freeSongTestUsed = false; n++; }
+  }
+  return n;
+}
+function apiKeyFindByValue(list, value) {
+  const v = typeof value === 'string' ? value.trim() : '';
+  if (!v) return null;
+  return (Array.isArray(list) ? list : []).find((x) => x && x.key === v) || null;
+}
+function apiKeyAuthCheck(list, value) {
+  const rec = apiKeyFindByValue(list, value);
+  if (!rec) return { ok: false, error: 'invalid_api_key' };
+  if (rec.revoked) return { ok: false, error: 'api_key_revoked' };
+  return { ok: true, key: rec };
+}
+// Deduct `cost` API credits. Balance never goes negative: an
+// unaffordable charge is refused and the balance is left untouched.
+function apiKeyDeduct(rec, cost) {
+  if (!rec || typeof rec !== 'object') return { ok: false, error: 'invalid_api_key' };
+  if (rec.revoked) return { ok: false, error: 'api_key_revoked' };
+  const c = Math.max(0, Math.floor(numOr(cost, 0)));
+  const bal = Math.max(0, Math.floor(numOr(rec.credits, 0)));
+  if (c <= 0) return { ok: true, cost: 0, balance: bal };
+  if (bal < c) return { ok: false, error: 'out_of_credits', cost: c, balance: bal };
+  rec.credits = bal - c;
+  return { ok: true, cost: c, balance: rec.credits };
+}
+// Song charge: the per-user free test first (0 credits, flag consumed),
+// otherwise the configured song cost (default 12).
+function apiSongCharge(rec, settings) {
+  if (!rec || typeof rec !== 'object') return { ok: false, error: 'invalid_api_key' };
+  if (rec.revoked) return { ok: false, error: 'api_key_revoked' };
+  const s = apiSettingsClean(settings);
+  if (rec.freeSongTestUsed !== true) {
+    rec.freeSongTestUsed = true;
+    return { ok: true, free: true, cost: 0, balance: Math.max(0, Math.floor(numOr(rec.credits, 0))) };
+  }
+  const d = apiKeyDeduct(rec, s.songCost);
+  if (!d.ok) return d;
+  return { ok: true, free: false, cost: d.cost, balance: d.balance };
+}
+// Image charge: images are FREE (0 credits, never deducted). The free
+// trial images are consumed first; after they run out, an active paid
+// API package is required when imageRequiresPackage is on.
+function apiImageCharge(rec, settings) {
+  if (!rec || typeof rec !== 'object') return { ok: false, error: 'invalid_api_key' };
+  if (rec.revoked) return { ok: false, error: 'api_key_revoked' };
+  const s = apiSettingsClean(settings);
+  const left = Math.max(0, Math.floor(numOr(rec.freeImagesLeft, 0)));
+  if (left > 0) {
+    rec.freeImagesLeft = left - 1;
+    return { ok: true, free: true, cost: 0, freeImagesLeft: rec.freeImagesLeft, balance: Math.max(0, Math.floor(numOr(rec.credits, 0))) };
+  }
+  if (s.imageRequiresPackage && !apiPackageById(rec.package)) return { ok: false, error: 'image_requires_package' };
+  return { ok: true, free: false, cost: 0, freeImagesLeft: 0, balance: Math.max(0, Math.floor(numOr(rec.credits, 0))) };
+}
+function apiKeyRecordUsage(rec, kind, n) {
+  if (!rec || typeof rec !== 'object') return;
+  if (!rec.usage || typeof rec.usage !== 'object') rec.usage = { songs: 0, images: 0, videos: 0, calls: 0 };
+  const c = Math.max(0, Math.floor(numOr(n, 0)));
+  if (kind === 'song') rec.usage.songs = Math.max(0, Math.floor(numOr(rec.usage.songs, 0))) + c;
+  else if (kind === 'image') rec.usage.images = Math.max(0, Math.floor(numOr(rec.usage.images, 0))) + c;
+  else if (kind === 'video') rec.usage.videos = Math.max(0, Math.floor(numOr(rec.usage.videos, 0))) + c;
+  rec.usage.calls = Math.max(0, Math.floor(numOr(rec.usage.calls, 0))) + 1;
+  rec.lastUsedAt = new Date().toISOString();
+}
+function apiImageRatio(width, height) {
+  const ar = (Number(width) || 1) / (Number(height) || 1);
+  const ratios = [['21:9', 21 / 9], ['16:9', 16 / 9], ['3:2', 3 / 2], ['4:3', 4 / 3], ['1:1', 1], ['3:4', 3 / 4], ['2:3', 2 / 3], ['9:16', 9 / 16]];
+  let r = '1:1', bd = 1e9;
+  for (const rr of ratios) { const d = Math.abs(Math.log(ar / rr[1])); if (d < bd) { bd = d; r = rr[0]; } }
+  return r;
+}
+function apiVideoUnavailable() { return { ok: false, error: 'video_not_available_yet', comingSoon: true }; }
+function apiKeyRegenerateValue(rec) {
+  const v = apiNewKeyValue();
+  rec.key = v;
+  rec.keyPrefix = apiKeyPrefixOf(v);
+  rec.regeneratedAt = new Date().toISOString();
+  return v;
+}
+async function loadApiKeys() {
+  const j = await loadKvDoc('api-keys', []);
+  return Array.isArray(j) ? j.filter((x) => x && typeof x === 'object' && typeof x.id === 'string' && typeof x.key === 'string' && typeof x.email === 'string') : [];
+}
+async function saveApiKeys(arr) {
+  await saveKvDoc('api-keys', Array.isArray(arr) ? arr : [], 'api-keys.json');
+}
+async function loadApiSettings() {
+  return apiSettingsClean(await loadKvDoc('api-settings', null));
+}
+async function saveApiSettings(s) {
+  const out = apiSettingsClean(s);
+  await saveKvDoc('api-settings', out, 'api-settings.json');
+  return out;
+}
 // The provider's stored keys as a list [{key, endpoint}] (multi-key
 // shape). Key VALUES are only used server-side — never returned or logged.
 async function adminProviderKeyList(provider) {
@@ -4559,6 +4734,87 @@ async function featureSettingsSave(patch) {
     at: Date.now(),
   };
   await saveKvDoc('feature-settings', out, 'feature-settings.json');
+  return out;
+}
+// ---- Background themes (Home redesign, owner order 2026-11-25) ----
+// kv_doc 'bg-themes': {activeId, at, themes:[{id, name, imageUrl,
+// gradient:[3 hex], acc1, acc2, dark, ink, muted}]}. The Home page
+// fetches the active theme from GET /api/public/bg-theme; Admin
+// manages the list via GET/POST /api/admin/bg-themes and uploads
+// background images via POST /api/admin/bg-theme/upload.
+function bgThemesDefault() {
+  return {
+    activeId: 'default',
+    at: new Date().toISOString(),
+    themes: [
+      { id: 'default', name: 'ដើម · Original', imageUrl: null, gradient: ['#e8f5f0', '#f2faf6', '#ffffff'], acc1: '#ff2d78', acc2: '#ff7a18', dark: false, ink: '#1f2937', muted: '#6b7280' },
+      { id: 'sunset', name: 'ថ្ងៃលិច · Sunset', imageUrl: null, gradient: ['#ffe0b8', '#ffb08a', '#ff7e9d'], acc1: '#ff512f', acc2: '#dd2476', dark: false, ink: '#3d2b1f', muted: '#7a5a4a' },
+      { id: 'ocean', name: 'សមុទ្រ · Ocean', imageUrl: null, gradient: ['#d6f0fa', '#a8e0f5', '#6ec6e8'], acc1: '#0288d1', acc2: '#26c6da', dark: false, ink: '#12303f', muted: '#4a6b7a' },
+      { id: 'forest', name: 'ព្រៃ · Forest', imageUrl: null, gradient: ['#dcf5d0', '#a8e6a3', '#5ec98a'], acc1: '#11998e', acc2: '#38ef7d', dark: false, ink: '#17301f', muted: '#4f6b52' },
+      { id: 'midnight', name: 'រាត្រី · Midnight', imageUrl: null, gradient: ['#0f0c29', '#302b63', '#24243e'], acc1: '#7c3aed', acc2: '#ec4899', dark: true, ink: '#f3f4f6', muted: '#9ca3af' },
+      { id: 'rose', name: 'ផ្កាកុលាប · Rose', imageUrl: null, gradient: ['#ffe3ee', '#fbc2eb', '#c5a3ff'], acc1: '#ec4899', acc2: '#8b5cf6', dark: false, ink: '#3a2233', muted: '#7a5a70' },
+    ],
+  };
+}
+function bgThemeIsHex(v) {
+  return typeof v === 'string' && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v);
+}
+// Clean one theme: keep only known fields, or return null if invalid.
+function bgThemeClean(t) {
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return null;
+  if (typeof t.id !== 'string' || !t.id.trim()) return null;
+  if (typeof t.name !== 'string' || !t.name.trim() || t.name.length > 80) return null;
+  if (!Array.isArray(t.gradient) || t.gradient.length !== 3 || !t.gradient.every(bgThemeIsHex)) return null;
+  if (!bgThemeIsHex(t.acc1) || !bgThemeIsHex(t.acc2) || !bgThemeIsHex(t.ink) || !bgThemeIsHex(t.muted)) return null;
+  if (typeof t.dark !== 'boolean') return null;
+  if (t.imageUrl !== null && t.imageUrl !== undefined) {
+    if (typeof t.imageUrl !== 'string' || t.imageUrl.length > 500) return null;
+    if (!(t.imageUrl.startsWith('http://') || t.imageUrl.startsWith('https://') || t.imageUrl.startsWith('/uploads/'))) return null;
+  }
+  return {
+    id: t.id.trim(), name: t.name.trim(),
+    imageUrl: (t.imageUrl === undefined || t.imageUrl === null) ? null : t.imageUrl,
+    gradient: [t.gradient[0], t.gradient[1], t.gradient[2]],
+    acc1: t.acc1, acc2: t.acc2, dark: t.dark, ink: t.ink, muted: t.muted,
+  };
+}
+// Validate a POST /api/admin/bg-themes body against the current doc.
+// Returns {ok:true, activeId, themes} or {ok:false, error}.
+function bgThemesValidate(body, cur) {
+  const curDoc = cur && typeof cur === 'object' && Array.isArray(cur.themes) ? cur : bgThemesDefault();
+  let themes = curDoc.themes;
+  if (body && body.themes !== undefined) {
+    if (!Array.isArray(body.themes) || body.themes.length < 1 || body.themes.length > 12) return { ok: false, error: 'themes ត្រូវជា array 1-12 · themes must be an array of 1-12 items' };
+    const cleaned = [];
+    for (const t of body.themes) {
+      const c = bgThemeClean(t);
+      if (!c) return { ok: false, error: 'theme មិនត្រឹមត្រូវ (id/name/gradient/acc/ink/muted/imageUrl) \u00b7 invalid theme' };
+      cleaned.push(c);
+    }
+    const ids = new Set(cleaned.map((c) => c.id));
+    if (ids.size !== cleaned.length) return { ok: false, error: 'id ស្ទួនគ្នា \u00b7 duplicate theme id' };
+    themes = cleaned;
+  }
+  let activeId = curDoc.activeId;
+  if (body && body.activeId !== undefined) {
+    if (typeof body.activeId !== 'string' || !themes.some((t) => t.id === body.activeId)) return { ok: false, error: 'activeId មិនមានក្នុងបញ្ជីទេ · activeId must match a theme id' };
+    activeId = body.activeId;
+  }
+  if (!themes.some((t) => t.id === activeId)) return { ok: false, error: 'activeId មិនមានក្នុងបញ្ជីទេ · activeId must match a theme id' };
+  return { ok: true, activeId, themes };
+}
+async function bgThemesLoad() {
+  try {
+    const j = await loadKvDoc('bg-themes', null);
+    if (!j || typeof j !== 'object') return bgThemesDefault();
+    const v = bgThemesValidate({ activeId: j.activeId, themes: j.themes }, bgThemesDefault());
+    if (!v.ok) return bgThemesDefault();
+    return { activeId: v.activeId, at: (typeof j.at === 'string' ? j.at : new Date().toISOString()), themes: v.themes };
+  } catch (e) { return bgThemesDefault(); }
+}
+async function bgThemesSave(doc) {
+  const out = { activeId: doc.activeId, at: new Date().toISOString(), themes: doc.themes };
+  await saveKvDoc('bg-themes', out, 'bg-themes.json');
   return out;
 }
 function splitTodayStr() {
@@ -10896,6 +11152,40 @@ async function apiRoute(req, res, urlPath) {
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
+  // GET /api/public/bg-theme — PUBLIC (no auth). The Home page reads
+  // the active background theme. On ANY load error the seeded default
+  // theme is returned — never a 500.
+  if (req.method === 'GET' && urlPath === '/api/public/bg-theme') {
+    try {
+      const d = await bgThemesLoad();
+      const theme = (d.themes || []).find((t) => t.id === d.activeId) || bgThemesDefault().themes[0];
+      return sendJSON(res, 200, { ok: true, theme });
+    } catch (e) {
+      return sendJSON(res, 200, { ok: true, theme: bgThemesDefault().themes[0] });
+    }
+  }
+  // GET /api/admin/bg-themes (admin key) lists all themes + activeId.
+  // POST /api/admin/bg-themes (admin key) saves {activeId?, themes?};
+  // bad input returns {ok:false, error} with HTTP 200.
+  if (req.method === 'GET' && urlPath === '/api/admin/bg-themes') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    const d = await bgThemesLoad();
+    return sendJSON(res, 200, { ok: true, activeId: d.activeId, themes: d.themes });
+  }
+  if (req.method === 'POST' && urlPath === '/api/admin/bg-themes') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJSON(res, 200, { ok: false, error: '\u179f\u17bc\u1798\u178a\u17b6\u1780\u17d2\u1780 activeId / themes' });
+      const cur = await bgThemesLoad();
+      const v = bgThemesValidate(body, cur);
+      if (!v.ok) return sendJSON(res, 200, { ok: false, error: v.error });
+      const out = await bgThemesSave({ activeId: v.activeId, themes: v.themes });
+      return sendJSON(res, 200, { ok: true, activeId: out.activeId, themes: out.themes });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
   // ---- Telegram shop bot on/off switch (owner order 2026-11-20 20:48) ----
   // The owner turned the telegram-gmail-bot Render service OFF (suspend)
   // to save hours, and wants an Admin switch to turn it back ON (resume)
@@ -12210,6 +12500,407 @@ async function apiRoute(req, res, urlPath) {
   if (req.method === 'GET' && urlPath === '/api/public/packages') {
     return sendJSON(res, 200, { ok: true, packages: await pubPackages() });
   }
+
+  // ---- Public API keys + /api/v1 (owner order 2026-11-25) ----
+  // v1 auth: Authorization: Bearer <key> or X-API-Key header. Billing
+  // errors use real HTTP codes (401 invalid/revoked key, 402 out of
+  // credits, 403 image needs a paid package); other failures follow the
+  // server convention of 200 {ok:false}. API credits never touch the
+  // app's Song Credits / media credits.
+  async function apiV1Auth(req) {
+    try {
+      const h = String((req.headers && req.headers.authorization) || '');
+      const m = /^Bearer\s+(.+)$/.exec(h);
+      const val = m ? m[1].trim() : String((req.headers && req.headers['x-api-key']) || '').trim();
+      if (!val) return { ok: false, error: 'invalid_api_key' };
+      const list = await loadApiKeys();
+      const chk = apiKeyAuthCheck(list, val);
+      if (!chk.ok) return { ok: false, error: chk.error };
+      return { ok: true, key: chk.key, list };
+    } catch (e) { return { ok: false, error: 'invalid_api_key' }; }
+  }
+  function apiV1Err(res, status, error, extra) {
+    const out = { ok: false, error };
+    if (extra && typeof extra === 'object') Object.assign(out, extra);
+    return sendJSON(res, status, out);
+  }
+  // GET /api/public/api-packages — PUBLIC. The 5 API packages + costs,
+  // for the API docs / pricing page (shown next to the app packages).
+  if (req.method === 'GET' && urlPath === '/api/public/api-packages') {
+    const s = await loadApiSettings();
+    return sendJSON(res, 200, { ok: true, packages: apiPackagesPublic(), costs: { song: s.songCost, image: s.imageCost, video: s.videoCost }, videoAvailable: false });
+  }
+  // POST /api/public/api-keys — {email, name?} — signed-in MovAi user.
+  // Creates a key; the FULL key is returned ONLY here (field `key`).
+  if (req.method === 'POST' && urlPath === '/api/public/api-keys') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      const email = normEmail(body && body.email);
+      if (!email) return sendJSON(res, 200, { ok: false, error: 'Please sign in first', needLogin: true });
+      const users = await loadUsers();
+      const u = users[email];
+      if (!u) return sendJSON(res, 200, { ok: false, error: 'Please sign in first', needLogin: true });
+      const settings = await loadApiSettings();
+      const list = await loadApiKeys();
+      const made = apiKeyNewRecord(list, email, (body && typeof body.name === 'string' ? body.name : '') || u.name || '', settings.freeImages);
+      list.push(made.record);
+      await saveApiKeys(list);
+      return sendJSON(res, 200, { ok: true, key: made.fullKey, apiKey: apiKeyPublic(made.record) });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // GET /api/public/api-keys?email= — the user's own keys, masked.
+  if (req.method === 'GET' && urlPath === '/api/public/api-keys') {
+    const email = normEmail(new URL(req.url, 'http://localhost').searchParams.get('email') || '');
+    if (!email) return sendJSON(res, 200, { ok: false, error: 'Please sign in first', needLogin: true });
+    const list = await loadApiKeys();
+    return sendJSON(res, 200, { ok: true, keys: list.filter((x) => x && String(x.email || '').toLowerCase() === email).map(apiKeyPublic) });
+  }
+  // POST /api/public/api-keys/revoke — {email, id} — revoke your own key.
+  if (req.method === 'POST' && urlPath === '/api/public/api-keys/revoke') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      const email = normEmail(body && body.email);
+      const id = body && typeof body.id === 'string' ? body.id.trim() : '';
+      if (!email || !id) return sendJSON(res, 200, { ok: false, error: 'email and id are required' });
+      const list = await loadApiKeys();
+      const rec = list.find((x) => x && x.id === id && String(x.email || '').toLowerCase() === email);
+      if (!rec) return sendJSON(res, 200, { ok: false, error: 'API key not found' });
+      rec.revoked = true;
+      rec.revokedAt = new Date().toISOString();
+      await saveApiKeys(list);
+      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec) });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // POST /api/public/api-keys/regenerate — {email, id} — new full key
+  // returned once; the old value stops working immediately. Balance,
+  // package, trial flags and usage carry over to the new value.
+  if (req.method === 'POST' && urlPath === '/api/public/api-keys/regenerate') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      const email = normEmail(body && body.email);
+      const id = body && typeof body.id === 'string' ? body.id.trim() : '';
+      if (!email || !id) return sendJSON(res, 200, { ok: false, error: 'email and id are required' });
+      const list = await loadApiKeys();
+      const rec = list.find((x) => x && x.id === id && String(x.email || '').toLowerCase() === email);
+      if (!rec) return sendJSON(res, 200, { ok: false, error: 'API key not found' });
+      if (rec.revoked) return sendJSON(res, 200, { ok: false, error: 'api_key_revoked' });
+      const fullKey = apiKeyRegenerateValue(rec);
+      await saveApiKeys(list);
+      return sendJSON(res, 200, { ok: true, key: fullKey, apiKey: apiKeyPublic(rec) });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // GET /api/v1/balance — API-key auth. Remaining credits + quota +
+  // package, like the app shows.
+  if (req.method === 'GET' && urlPath === '/api/v1/balance') {
+    (async () => {
+      const auth = await apiV1Auth(req);
+      if (!auth.ok) return apiV1Err(res, 401, auth.error);
+      const s = await loadApiSettings();
+      const k = auth.key;
+      return sendJSON(res, 200, { ok: true, credits: Math.max(0, Math.floor(numOr(k.credits, 0))), package: k.package || '', packageExpiresAt: k.packageExpiresAt || '', freeImagesLeft: Math.max(0, Math.floor(numOr(k.freeImagesLeft, 0))), freeSongTestUsed: k.freeSongTestUsed === true, costs: { song: s.songCost, image: s.imageCost, video: s.videoCost }, usage: (k.usage && typeof k.usage === 'object') ? k.usage : { songs: 0, images: 0, videos: 0, calls: 0 }, email: k.email });
+    })().catch(() => sendJSON(res, 200, { ok: false, error: 'balance failed' }));
+    return;
+  }
+  // GET /api/v1/usage — API-key auth. Usage counters for the key.
+  if (req.method === 'GET' && urlPath === '/api/v1/usage') {
+    (async () => {
+      const auth = await apiV1Auth(req);
+      if (!auth.ok) return apiV1Err(res, 401, auth.error);
+      const k = auth.key;
+      return sendJSON(res, 200, { ok: true, usage: (k.usage && typeof k.usage === 'object') ? k.usage : { songs: 0, images: 0, videos: 0, calls: 0 }, credits: Math.max(0, Math.floor(numOr(k.credits, 0))), package: k.package || '', freeImagesLeft: Math.max(0, Math.floor(numOr(k.freeImagesLeft, 0))), freeSongTestUsed: k.freeSongTestUsed === true, lastUsedAt: k.lastUsedAt || '' });
+    })().catch(() => sendJSON(res, 200, { ok: false, error: 'usage failed' }));
+    return;
+  }
+  // POST /api/v1/songs — API-key auth. REUSES the app's Suno path
+  // (POST /api/gen/song provider 'suno'): same sunoapi.org gateway
+  // endpoint + key rotation, same request body, same 2-song output.
+  // Cost is 12 API credits per generation (or the one-time free test);
+  // the app's Song Credits are never touched. My Voice is not offered
+  // over the API yet. Returns {ok, jobId, songs:2, ...}; poll
+  // POST /api/v1/songs/status for the finished songs.
+  if (req.method === 'POST' && urlPath === '/api/v1/songs') {
+    readJSONBody(req, 256 * 1024).then(async (body) => {
+      try {
+        const auth = await apiV1Auth(req);
+        if (!auth.ok) return apiV1Err(res, 401, auth.error);
+        const b = body && typeof body === 'object' ? body : {};
+        if (typeof b.prompt !== 'string' && typeof b.title !== 'string' && typeof b.lyrics !== 'string' && typeof b.style !== 'string') return sendJSON(res, 200, { ok: false, error: 'prompt, title, lyrics or style is required' });
+        const title = typeof b.title === 'string' ? b.title.trim().slice(0, 200) : '';
+        const lyrics = typeof b.lyrics === 'string' ? b.lyrics.trim().slice(0, 10000) : '';
+        const style = typeof b.style === 'string' ? b.style.trim().slice(0, 500) : '';
+        const voice = b.voice === 'male' || b.voice === 'female' ? b.voice : 'random';
+        const prompt = typeof b.prompt === 'string' ? b.prompt.trim().slice(0, 10000) : '';
+        const model = typeof b.model === 'string' && b.model.trim() ? b.model.trim().slice(0, 50) : 'v6';
+        const instrumental = b.instrumental === true || b.make_instrumental === true;
+        if (!title && !lyrics && !style && !prompt) return sendJSON(res, 200, { ok: false, error: 'prompt, title, lyrics or style is required' });
+        const sunoKeys = (await adminProviderKeyList('suno')).filter((e) => e.endpoint);
+        if (!sunoKeys.length) {
+          if (!(await adminProviderKeyList('suno')).length) return sendJSON(res, 200, { ok: false, error: 'Admin has not added a Suno key yet' });
+          return sendJSON(res, 200, { ok: false, error: 'Admin has not added a Suno endpoint yet' });
+        }
+        const settings = await loadApiSettings();
+        const keyRec = auth.key;
+        const keyList = auth.list;
+        // Per-user free test: if ANY of this user's keys already used
+        // it, this key's test is used too (no second free generation).
+        if (keyList.some((x) => x && String(x.email || '').toLowerCase() === String(keyRec.email || '').toLowerCase() && x.freeSongTestUsed === true)) keyRec.freeSongTestUsed = true;
+        const charge = apiSongCharge(keyRec, settings);
+        if (!charge.ok) {
+          if (charge.error === 'out_of_credits') return apiV1Err(res, 402, 'out_of_credits', { cost: charge.cost, balance: charge.balance, needBuy: true });
+          return apiV1Err(res, 401, charge.error);
+        }
+        await saveApiKeys(keyList);
+        const genBody = { customMode: true, instrumental, callBackUrl: SUNO_CALLBACK_URL, model: sunoApiModel(model), style: (style || 'pop').slice(0, 1000), lyrics: instrumental ? '' : (lyrics || prompt || '').slice(0, 5000), title: title.slice(0, 80) };
+        if (voice === 'male') genBody.vocalGender = 'm';
+        else if (voice === 'female') genBody.vocalGender = 'f';
+        let out;
+        try {
+          out = await withProviderKeyRotation('suno', async (k, endpoint) => {
+            const ep = endpoint.replace(/\/+$/, '');
+            const r = await fetch(ep + '/api/v1/generate', { method: 'POST', headers: { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' }, body: JSON.stringify(genBody), signal: AbortSignal.timeout(60000) });
+            const j = await r.json().catch(() => null);
+            const data = (j && j.data) || {};
+            const taskId = typeof data.taskId === 'string' ? data.taskId : '';
+            if (j && j.code === 200 && taskId) return { jobId: taskId };
+            throw rotErr('Suno: ' + sunoErrText(j, 'HTTP ' + r.status), r.status);
+          }, '', sunoKeys);
+        } catch (e) {
+          // Provider failed: refund — restore the free-test flag for
+          // the whole user, or give the deducted credits back.
+          if (charge.free) { try { apiUnmarkFreeSongUsedForUser(keyList, keyRec.email); } catch (e2) {} }
+          else { keyRec.credits = Math.max(0, Math.floor(numOr(keyRec.credits, 0)) + charge.cost); }
+          try { await saveApiKeys(keyList); } catch (e2) {}
+          return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Suno: request failed' });
+        }
+        if (charge.free) { try { apiMarkFreeSongUsedForUser(keyList, keyRec.email); } catch (e2) {} }
+        apiKeyRecordUsage(keyRec, 'song', 2);
+        try { await saveApiKeys(keyList); } catch (e2) {}
+        return sendJSON(res, 200, { ok: true, jobId: out.jobId, songs: 2, expectedSongs: 2, cost: charge.cost, free: charge.free === true, credits: keyRec.credits, freeSongTestUsed: keyRec.freeSongTestUsed === true, status: 'generating', statusUrl: '/api/v1/songs/status' });
+      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'Suno: request failed — ' + (e && e.message ? e.message : 'unknown') }); }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // POST /api/v1/songs/status — API-key auth. {jobId} → the same Suno
+  // stream store + record-info fallback the app's
+  // POST /api/gen/song/status uses (webhook first, 12s-throttled poll).
+  if (req.method === 'POST' && urlPath === '/api/v1/songs/status') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      try {
+        const auth = await apiV1Auth(req);
+        if (!auth.ok) return apiV1Err(res, 401, auth.error);
+        const jobId = body && typeof body.jobId === 'string' ? body.jobId.trim() : '';
+        if (!jobId) return sendJSON(res, 200, { ok: false, error: 'jobId is required' });
+        const sunoKeys = (await adminProviderKeyList('suno')).filter((e) => e.endpoint);
+        if (!sunoKeys.length) return sendJSON(res, 200, { ok: false, error: 'Admin has not added a Suno key/endpoint yet' });
+        let ss = null;
+        try { ss = await sunoStreamLoad(jobId); } catch (e) {}
+        if (ss && ss.status === 'ready' && ss.songs && ss.songs.length) {
+          return sendJSON(res, 200, { ok: true, status: 'done', songs: sunoStreamToSongs(ss) });
+        }
+        if (ss && ss.status === 'streaming' && ss.songs && ss.songs.length) {
+          const sp = sunoStreamToSongs(ss);
+          return sendJSON(res, 200, { ok: true, status: 'working', providerStatus: 'first', preview: sp.length ? (sp[0].streamAudioUrl || sp[0].url) : '', songs: sp });
+        }
+        if (ss && ss.status === 'failed') return sendJSON(res, 200, { ok: false, error: 'Suno: generation failed' });
+        const cb = sunoCallbacks.get(jobId);
+        if (cb && cb.status === 'SUCCESS' && cb.songs && cb.songs.length) {
+          return sendJSON(res, 200, { ok: true, status: 'done', songs: sunoSongsKeepEarlyUrl(cb.songs, cb.firstSongs) });
+        }
+        const cached = sunoRecInfoCache.get(jobId);
+        if (cached && cached.out && Date.now() - cached.at < 12000) {
+          return sendJSON(res, 200, Object.assign({ ok: true }, cached.out));
+        }
+        let out;
+        let jobFailed = false;
+        try {
+          out = await withProviderKeyRotation('suno', async (k, endpoint) => {
+            const ep = endpoint.replace(/\/+$/, '');
+            const r = await fetch(ep + '/api/v1/generate/record-info?taskId=' + encodeURIComponent(jobId), { headers: { 'Authorization': 'Bearer ' + k }, signal: AbortSignal.timeout(30000) });
+            const j = await r.json().catch(() => null);
+            if (r.status === 401 || r.status === 403 || r.status === 429) throw rotErr('Suno: ' + sunoErrText(j, 'HTTP ' + r.status), r.status);
+            const d = (j && j.data) || null;
+            if (!d || typeof d.status !== 'string') { jobFailed = true; throw rotErr('Suno: could not find this job', r.status); }
+            const st = d.status.toUpperCase();
+            if (st === 'SUCCESS') {
+              const songs = sunoSongsKeepEarlyUrl(sunoSongsFromData(d), cb && cb.firstSongs);
+              if (!songs.length) throw rotErr('Suno: finished with no songs', r.status);
+              try { const sm = sunoStreamMerge(jobId, d, 'SUCCESS'); if (sm.changed) sunoStreamPersist(jobId); try { sunoStreamSave(jobId).catch(function() {}); } catch (e2) {} } catch (e2) {}
+              return { status: 'done', songs };
+            }
+            if (st === 'FIRST_SUCCESS') {
+              try { const sm = sunoStreamMerge(jobId, d, 'FIRST_SUCCESS'); if (sm.changed) sunoStreamPersist(jobId); } catch (e2) {}
+              return { status: 'working', providerStatus: 'first', preview: sunoPreviewFromData(d), streamUrl: sunoPreviewFromData(d), songs: sunoSongsFromData(d) };
+            }
+            if (st === 'PENDING' || st === 'TEXT_SUCCESS') {
+              try { const sm = sunoStreamMerge(jobId, d, st); if (sm.changed) sunoStreamPersist(jobId); } catch (e2) {}
+              return { status: 'working', providerStatus: st === 'TEXT_SUCCESS' ? 'text' : 'queued' };
+            }
+            jobFailed = true;
+            throw rotErr('Suno: ' + (d.errorMessage || ('generation failed · ' + st)), r.status);
+          }, '', sunoKeys);
+        } catch (e) {
+          if (jobFailed) return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Suno: request failed' });
+          if (ss && ss.status === 'generating') return sendJSON(res, 200, { ok: true, status: 'working', providerStatus: 'text', lyrics: ss.lyrics || '' });
+          return sendJSON(res, 200, { ok: false, error: (e && e.message) || 'Suno: request failed' });
+        }
+        try { sunoRecInfoCache.set(jobId, { at: Date.now(), out }); if (sunoRecInfoCache.size > 200) { const rk = sunoRecInfoCache.keys().next().value; sunoRecInfoCache.delete(rk); } } catch (e) {}
+        return sendJSON(res, 200, Object.assign({ ok: true }, out));
+      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'Suno: request failed — ' + (e && e.message ? e.message : 'unknown') }); }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // POST /api/v1/images — API-key auth. REUSES the app's auto-image
+  // Agnes path (POST /api/gen/image provider 'auto': Agnes models
+  // 2.5/2.1/2.0 rotating, same apihub endpoint, same prompt translate
+  // + quality suffix). Images are FREE: 0 credits, never deducted.
+  // The 4 trial images are consumed first; after that an active paid
+  // API package is required (imageRequiresPackage setting).
+  if (req.method === 'POST' && urlPath === '/api/v1/images') {
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      try {
+        const auth = await apiV1Auth(req);
+        if (!auth.ok) return apiV1Err(res, 401, auth.error);
+        const b = body && typeof body === 'object' ? body : {};
+        if (!b.prompt || typeof b.prompt !== 'string' || !b.prompt.trim()) return sendJSON(res, 200, { ok: false, error: 'prompt is required' });
+        const settings = await loadApiSettings();
+        const keyRec = auth.key;
+        const keyList = auth.list;
+        const charge = apiImageCharge(keyRec, settings);
+        if (!charge.ok) {
+          if (charge.error === 'image_requires_package') return apiV1Err(res, 403, 'image_requires_package', { message: 'Free images used up — image generation now requires an active paid API package', freeImagesLeft: 0 });
+          return apiV1Err(res, 401, charge.error);
+        }
+        await saveApiKeys(keyList);
+        let prompt = b.prompt.trim().slice(0, 2000);
+        if (/[^\x00-\x7F]/.test(prompt)) {
+          const en = await translateImgPromptToEnglish(prompt);
+          if (en) prompt = en.slice(0, 2000);
+        }
+        if (!/highly detailed|sharp focus/i.test(prompt)) prompt = (prompt + ', highly detailed, sharp focus').slice(0, 2000);
+        const width = Math.max(64, Math.min(2048, Number(b.width) || 768));
+        const height = Math.max(64, Math.min(2048, Number(b.height) || 768));
+        const models = ['agnes-image-2.5-flash', 'agnes-image-2.1-flash', 'agnes-image-2.0-flash'];
+        const rot = _autoAgnesRot % models.length;
+        _autoAgnesRot = rot + 1;
+        const order = models.slice(rot).concat(models.slice(0, rot));
+        let out = null, usedModel = '', lastErr = null;
+        for (const m of order) {
+          try {
+            out = await withProviderKeyRotation('agnes', async (k) => {
+              const r = await fetch('https://apihub.agnes-ai.com/v1/images/generations', { method: 'POST', headers: { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: m, prompt, size: '1K', ratio: apiImageRatio(width, height), n: 1 }), signal: AbortSignal.timeout(60000) });
+              const j = await r.json().catch(() => null);
+              const url = j && j.data && (Array.isArray(j.data) ? (j.data[0] && (j.data[0].url || j.data[0].image_url)) : (j.data.url || j.data.image_url));
+              if (url) return { done: true, imageUrl: url };
+              const id = j && (j.id || (j.data && !Array.isArray(j.data) && j.data.id));
+              if (id) return { jobId: id };
+              throw rotErr('Agnes: ' + genErrText(j, 'HTTP ' + r.status), r.status);
+            });
+            usedModel = m;
+            break;
+          } catch (e) { lastErr = e; if (e && e.noKey) break; }
+        }
+        if (!out) {
+          if (charge.free) { keyRec.freeImagesLeft = Math.max(0, Math.floor(numOr(keyRec.freeImagesLeft, 0))) + 1; try { await saveApiKeys(keyList); } catch (e2) {} }
+          return sendJSON(res, 200, { ok: false, error: (lastErr && lastErr.message) || 'Agnes: request failed' });
+        }
+        apiKeyRecordUsage(keyRec, 'image', 1);
+        try { await saveApiKeys(keyList); } catch (e2) {}
+        if (out.imageUrl) return sendJSON(res, 200, { ok: true, imageUrl: out.imageUrl, provider: 'agnes', model: usedModel, cost: 0, free: charge.free === true, freeImagesLeft: keyRec.freeImagesLeft, credits: keyRec.credits });
+        return sendJSON(res, 200, { ok: true, jobId: out.jobId, status: 'processing', provider: 'agnes', model: usedModel, cost: 0, free: charge.free === true, freeImagesLeft: keyRec.freeImagesLeft, credits: keyRec.credits });
+      } catch (e) { return sendJSON(res, 200, { ok: false, error: 'Image: request failed — ' + (e && e.message ? e.message : 'unknown') }); }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // POST /api/v1/videos — API-key auth, then Coming Soon. Video
+  // generation is NOT built: no provider is ever called.
+  if (req.method === 'POST' && urlPath === '/api/v1/videos') {
+    readJSONBody(req, 64 * 1024).then(async () => {
+      const auth = await apiV1Auth(req);
+      if (!auth.ok) return apiV1Err(res, 401, auth.error);
+      return sendJSON(res, 503, apiVideoUnavailable());
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // GET /api/admin/api-keys — admin key required. All keys, masked.
+  if (req.method === 'GET' && urlPath === '/api/admin/api-keys') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    const list = await loadApiKeys();
+    return sendJSON(res, 200, { ok: true, keys: list.map(apiKeyPublic), count: list.length });
+  }
+  // POST /api/admin/api-keys — {id, action:'revoke'|'unrevoke'} or
+  // {id, revoked:true|false} — admin key required.
+  if (req.method === 'POST' && urlPath === '/api/admin/api-keys') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      const id = body && typeof body.id === 'string' ? body.id.trim() : '';
+      let rev = null;
+      if (body && body.action === 'revoke') rev = true;
+      else if (body && body.action === 'unrevoke') rev = false;
+      else if (body && body.revoked === true) rev = true;
+      else if (body && body.revoked === false) rev = false;
+      if (!id || rev === null) return sendJSON(res, 200, { ok: false, error: 'id and action (revoke/unrevoke) are required' });
+      const list = await loadApiKeys();
+      const rec = list.find((x) => x && x.id === id);
+      if (!rec) return sendJSON(res, 200, { ok: false, error: 'API key not found' });
+      rec.revoked = rev;
+      rec.revokedAt = rev ? new Date().toISOString() : '';
+      await saveApiKeys(list);
+      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec) });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // POST /api/admin/api-credits — {keyId|id, amount, package?} — admin
+  // key required. Grants API credits to a key (like the MV grant for
+  // app credits). Optionally sets the key's active API package.
+  if (req.method === 'POST' && urlPath === '/api/admin/api-credits') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      const id = body && typeof (body.keyId || body.id) === 'string' ? (body.keyId || body.id).trim() : '';
+      const amount = Math.floor(numOr(body && body.amount, 0));
+      if (!id) return sendJSON(res, 200, { ok: false, error: 'keyId is required' });
+      if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000) return sendJSON(res, 200, { ok: false, error: 'amount must be a positive number of credits' });
+      const list = await loadApiKeys();
+      const rec = list.find((x) => x && x.id === id);
+      if (!rec) return sendJSON(res, 200, { ok: false, error: 'API key not found' });
+      if (rec.revoked) return sendJSON(res, 200, { ok: false, error: 'api_key_revoked' });
+      rec.credits = Math.max(0, Math.floor(numOr(rec.credits, 0))) + amount;
+      if (body && typeof body.package === 'string' && body.package.trim()) {
+        const p = apiPackageById(body.package);
+        if (!p) return sendJSON(res, 200, { ok: false, error: 'unknown API package: ' + body.package.trim() });
+        rec.package = p.id;
+        rec.packageExpiresAt = new Date(Date.now() + 30 * 86400000).toISOString();
+      }
+      await saveApiKeys(list);
+      try { await addNotification('grant', rec.email, '➕ API credits granted', '+' + amount + ' API credits to key ' + apiKeyMask(rec.key || '') + ' (balance ' + rec.credits + ')', { extra: { apiCredits: true, apiKeyId: rec.id, amount } }); } catch (e) {}
+      return sendJSON(res, 200, { ok: true, apiKey: apiKeyPublic(rec) });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
+  // GET /api/admin/api-settings — admin key required. Per-call costs,
+  // the imageRequiresPackage flag, free-image count, video package
+  // price, and the 5 API packages.
+  if (req.method === 'GET' && urlPath === '/api/admin/api-settings') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    return sendJSON(res, 200, { ok: true, settings: await loadApiSettings(), packages: apiPackagesPublic() });
+  }
+  // POST /api/admin/api-settings — {songCost?, videoCost?,
+  // videoPackagePrice?, imageRequiresPackage?, freeImages?} — admin key
+  // required. imageCost is always 0 (images are free by owner order).
+  if (req.method === 'POST' && urlPath === '/api/admin/api-settings') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 64 * 1024).then(async (body) => {
+      const cur = await loadApiSettings();
+      const next = apiSettingsClean(Object.assign({}, cur, body && typeof body === 'object' ? body : {}));
+      await saveApiSettings(next);
+      return sendJSON(res, 200, { ok: true, settings: next, packages: apiPackagesPublic() });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'Bad request', 'Bad request')));
+    return;
+  }
   // POST /api/admin/packages — {packages:[{id, price, originalPrice?}]}
   // — admin key required. Edits price and/or originalPrice per package id.
   // Unknown ids are rejected; price/originalPrice must be >= 0. Returns the
@@ -12524,6 +13215,7 @@ async function apiRoute(req, res, urlPath) {
       const _m = typeof body.method === 'string' ? body.method.trim().toLowerCase() : '';
       const payMethod = _m === 'khqr' || _m === 'usdt' ? _m : '';
       let packageId = '', pkg = null, feature = '', postType = '', discLabel = '', dsSlotPrice = 0, dsFingerprint = '';
+      let apiPkg = null, apiKeyId = '';
       const reqs = await loadPurchaseRequests();
       if (kind === 'discount') {
         feature = typeof body.feature === 'string' ? body.feature.trim().toLowerCase() : '';
@@ -12573,6 +13265,20 @@ async function apiRoute(req, res, urlPath) {
         packageId = 'device-slot';
         dsSlotPrice = dsDl.slotPrice;
         dsFingerprint = dsFp;
+      } else if (kind === 'api-package') {
+        // API package (KHQR/USDT receipt → Admin approves → API credits
+        // are granted to the buyer's API key, never to app credits).
+        const ap = apiPackageById(typeof body.packageId === 'string' ? body.packageId.trim() : '');
+        if (!ap) return sendJSON(res, 200, { ok: false, error: 'Unknown API package' });
+        const akId = typeof body.apiKeyId === 'string' ? body.apiKeyId.trim() : (typeof body.keyId === 'string' ? body.keyId.trim() : '');
+        if (!akId) return sendJSON(res, 200, { ok: false, error: 'Please choose an API key' });
+        const akList = await loadApiKeys();
+        const akRec = akList.find((x) => x && x.id === akId && String(x.email || '').toLowerCase() === email);
+        if (!akRec) return sendJSON(res, 200, { ok: false, error: 'API key not found' });
+        if (akRec.revoked) return sendJSON(res, 200, { ok: false, error: 'api_key_revoked' });
+        packageId = ap.id;
+        apiPkg = ap;
+        apiKeyId = akId;
       } else {
         packageId = typeof body.packageId === 'string' ? body.packageId.trim() : '';
         pkg = (await loadPackages())[packageId];
@@ -12581,13 +13287,14 @@ async function apiRoute(req, res, urlPath) {
       const now = new Date().toISOString();
       const r = {
         id: newPurchaseId(), email, packageId, method: payMethod,
-        kind: kind === 'device-slot' ? 'device-slot' : (kind === 'pin-delete' ? 'pin-delete' : (kind === 'discount' ? 'discount' : 'package')),
+        kind: kind === 'device-slot' ? 'device-slot' : (kind === 'pin-delete' ? 'pin-delete' : (kind === 'discount' ? 'discount' : (kind === 'api-package' ? 'api-package' : 'package'))),
         feature: kind === 'discount' ? feature : '',
         postType: kind === 'discount' ? postType : '',
-        plan: kind === 'device-slot' ? 'Gmail Slot · 1 Gmail' : (kind === 'pin-delete' ? 'Delete 6-digit PIN · លុបលេខកូដ 6 ខ្ទង់' : (kind === 'discount' ? discLabel : (typeof body.plan === 'string' ? body.plan.slice(0, 50) : packageId))),
-        amount: (kind === 'device-slot' || kind === 'pin-delete') ? dsSlotPrice : (kind === 'discount' ? DISCOUNT_PACK[feature].price : pkg.price),
-        credits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : pkg.credits), songCredits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : pkg.songCredits), days: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : pkg.days),
+        plan: kind === 'device-slot' ? 'Gmail Slot · 1 Gmail' : (kind === 'pin-delete' ? 'Delete 6-digit PIN · លុបលេខកូដ 6 ខ្ទង់' : (kind === 'discount' ? discLabel : (kind === 'api-package' ? ('API Package · ' + packageId) : (typeof body.plan === 'string' ? body.plan.slice(0, 50) : packageId)))),
+        amount: (kind === 'device-slot' || kind === 'pin-delete') ? dsSlotPrice : (kind === 'discount' ? DISCOUNT_PACK[feature].price : (kind === 'api-package' ? apiPkg.price : pkg.price)),
+        credits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? apiPkg.credits : pkg.credits)), songCredits: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? 0 : pkg.songCredits)), days: (kind === 'device-slot' || kind === 'pin-delete') ? 0 : (kind === 'discount' ? 0 : (kind === 'api-package' ? 30 : pkg.days)),
         fingerprint: (kind === 'device-slot' || kind === 'pin-delete') ? dsFingerprint : '',
+        apiKeyId: kind === 'api-package' ? apiKeyId : '',
         receiptUrl: typeof body.receiptUrl === 'string' ? body.receiptUrl.trim().slice(0, 500) : '',
         status: 'pending', createdAt: now, updatedAt: now,
       };
@@ -12602,6 +13309,8 @@ async function apiRoute(req, res, urlPath) {
         await addNotification('purchase-request', email, '🛒 ស្នើទិញ Gmail Slot · Gmail slot purchase request', email + ' · ID: ' + _puid + ' សុំទិញ 1 Gmail បន្ថែម តម្លៃ $' + walletMoney(dsSlotPrice).toFixed(2) + ' (' + (payMethod === 'usdt' ? 'QR USDT' : 'KHQR') + ' — បានបង់ហើយ មានវិក្កយបត្រភ្ជាប់មក) · Wants 1 extra Gmail slot', { extra: { pkg: packageId, pkgName: 'Gmail Slot · 1 Gmail', priceText: '$' + walletMoney(dsSlotPrice).toFixed(2), creditText: '1 Gmail', buyerId: _puid, deviceSlot: true, fingerprint: dsFingerprint } });
       } else if (kind === 'discount') {
         await addNotification('purchase-request', email, '🛒 សំណើទិញ Discount · Discount purchase request', email + ' · ID: ' + _puid + ' សុំទិញ ' + discLabel + ' តម្លៃ $' + DISCOUNT_PACK[feature].price.toFixed(2) + ' (KHQR/USDT — បានបង់ហើយ មានវិក្កយបត្រភ្ជាប់មក)', { extra: { pkg: packageId, pkgName: discLabel, priceText: '$' + DISCOUNT_PACK[feature].price.toFixed(2), creditText: '4× ' + (feature === 'post' ? 'Post' : feature === 'download' ? 'Download' : feature === 'mv' ? 'MV' : 'Vocal Studio'), buyerId: _puid, discount: true, feature, postType } });
+      } else if (kind === 'api-package') {
+        await addNotification('purchase-request', email, '🛒 សំណើទិញកញ្ចប់ API · API package purchase request', email + ' · ID: ' + _puid + ' សុំទិញកញ្ចប់ API ' + packageId + ' តម្លៃ $' + walletMoney(apiPkg.price).toFixed(2) + ' (+' + apiPkg.credits + ' API credits)', { extra: { pkg: packageId, pkgName: 'API Package · ' + packageId, priceText: '$' + walletMoney(apiPkg.price).toFixed(2), creditText: '+' + apiPkg.credits + ' API credits', buyerId: _puid, apiPackage: true, apiKeyId } });
       } else {
         const _pd = pkgDisplay(pkg);
         await addNotification('purchase-request', email, '🛒 សំណើទិញកញ្ចប់ · Purchase request', pkgNotifText(pkg, email, _puid), { extra: { pkg: packageId, pkgName: _pd.pkgName, priceText: _pd.priceText, creditText: _pd.creditText, buyerId: _puid }, telegramHtml: pkgNotifTelegram('🛒 សំណើទិញកញ្ចប់ · Purchase request', pkg, email, _puid) });
@@ -12716,6 +13425,34 @@ async function apiRoute(req, res, urlPath) {
         await addNotification('purchase-approved', r.email, '✅ បានអនុម័ត · PIN delete approved', 'ការលុបលេខកូដ 6 ខ្ទង់ ($0.25) បានអនុម័ត — ឥឡូវអ្នកអាចដាក់លេខកូដថ្មី ឬមិនដាក់ក៏បាន · Your 6-digit PIN delete is approved — you can set a new code or leave it off', { extra: { pinDelete: true, fingerprint: r.fingerprint || '', decision: 'approved' } });
         await markPurchaseRequestDecided(r.email, r.packageId, 'approved', pdNow);
         return sendJSON(res, 200, { ok: true, request: r });
+      }
+      if (r.kind === 'api-package') {
+        // API package approve: grant API credits to the buyer's API key
+        // (and set its active package). App credits are never touched.
+        // Runs only while the request is still 'pending' (checked
+        // above), so a second approve can never grant twice.
+        const apPkg = apiPackageById(r.packageId);
+        if (!apPkg) return sendJSON(res, 200, { ok: false, error: 'Unknown API package' });
+        const apUsers = await loadUsers();
+        const apU = apUsers[r.email];
+        if (!apU) return sendJSON(res, 200, { ok: false, error: 'User not found' });
+        const akList = await loadApiKeys();
+        const akRec = akList.find((x) => x && x.id === (r.apiKeyId || '') && String(x.email || '').toLowerCase() === String(r.email || '').toLowerCase());
+        if (!akRec) return sendJSON(res, 200, { ok: false, error: 'API key not found' });
+        if (akRec.revoked) return sendJSON(res, 200, { ok: false, error: 'api_key_revoked' });
+        const apNow = new Date().toISOString();
+        akRec.credits = Math.max(0, Math.floor(numOr(akRec.credits, 0))) + apPkg.credits;
+        akRec.package = apPkg.id;
+        akRec.packageExpiresAt = new Date(Date.now() + 30 * 86400000).toISOString();
+        await saveApiKeys(akList);
+        r.status = 'approved';
+        r.decidedAt = apNow;
+        r.updatedAt = apNow;
+        await savePurchaseRequests(reqs);
+        scheduleBackup('purchase-requests.json');
+        await addNotification('purchase-approved', r.email, '✅ បានអនុម័ត · API package approved', 'កញ្ចប់ API ' + apPkg.id + ' ($' + walletMoney(apPkg.price).toFixed(2) + ') បានអនុម័ត — +' + apPkg.credits + ' API credits ចូល Key ' + apiKeyMask(akRec.key || '') + ' (នៅសល់ ' + akRec.credits + ')', { extra: { apiPackage: true, pkg: apPkg.id, apiKeyId: akRec.id, buyerId: apU.id || '—', decision: 'approved' } });
+        await markPurchaseRequestDecided(r.email, r.packageId, 'approved', apNow);
+        return sendJSON(res, 200, { ok: true, request: r, apiKey: apiKeyPublic(akRec) });
       }
       const pkg = (r.kind === 'discount' || r.kind === 'song-sale' || r.type === 'song-sale') ? null : (await loadPackages())[r.packageId];
       if (!pkg && r.kind !== 'discount' && r.kind !== 'song-sale' && r.type !== 'song-sale') return sendJSON(res, 200, { ok: false, error: 'កញ្ចប់នេះមិនស្គាល់ទេ' });
@@ -15556,6 +16293,37 @@ async function apiRoute(req, res, urlPath) {
         return sendJSON(res, 200, { ok: true, url: proto + '://' + host + '/uploads/' + name, name, kind, size: buf.length });
       } catch (e) {
         return sendJSON(res, 200, { ok: false, error: 'រក្សាទុកឯកសារបរាជ័យ' });
+      }
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+  // POST /api/admin/bg-theme/upload — ADMIN KEY required. JSON
+  // {filename, data: base64}. Background image for a Home theme.
+  // JPG/JPEG/PNG/WebP only, decoded size <= 5 MB. Saved as
+  // bg-<timestamp>-<random>.<ext> under ./data/uploads/ and backed up
+  // to GitHub via ghPutUploadVerified — success is REFUSED if the
+  // backup fails (same rule as /api/public/upload).
+  if (req.method === 'POST' && urlPath === '/api/admin/bg-theme/upload') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    readJSONBody(req, 8 * 1024 * 1024).then(async (body) => {
+      const ext = uploadSafeExt('image', body && body.filename);
+      if (!ext || !['.jpg', '.jpeg', '.png', '.webp'].includes(ext)) return sendJSON(res, 200, { ok: false, error: 'សូមជ្រើសរូបភាព JPG/PNG/WebP \u00b7 Image must be JPG, PNG or WebP' });
+      const b64 = body && typeof body.data === 'string' ? body.data.replace(/\s/g, '') : '';
+      if (!b64 || !/^[A-Za-z0-9+/=]+$/.test(b64)) return sendJSON(res, 200, { ok: false, error: 'ទិន្នន័យរូបភាពមិនត្រឹមត្រូវទេ' });
+      const buf = Buffer.from(b64, 'base64');
+      if (!buf.length) return sendJSON(res, 200, { ok: false, error: 'រូបភាពទទេ' });
+      if (buf.length > 5 * 1024 * 1024) return sendJSON(res, 200, { ok: false, error: 'too_big' });
+      try {
+        fs.mkdirSync(path.join(DATA_DIR, 'uploads'), { recursive: true });
+        const name = 'bg-' + Date.now() + '-' + crypto.randomInt(100000, 999999) + ext;
+        fs.writeFileSync(path.join(UPLOADS_DIR, name), buf);
+        const proto = req.headers && req.headers['x-forwarded-proto'] === 'http' ? 'http' : 'https';
+        const host = (req.headers && req.headers.host) || 'movai-proxy-dphl.onrender.com';
+        if (!(await ghPutUploadVerified(name, b64))) return sendJSON(res, 200, { ok: false, error: 'រក្សាទុកឯកសារបរាជ័យ (GitHub backup) — សូមព្យាយាមម្តងទៀត \u00b7 Upload backup failed, please try again' });
+        return sendJSON(res, 200, { ok: true, url: proto + '://' + host + '/uploads/' + name, name, size: buf.length });
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, error: 'រក្សាទុករូបភាពបរាជ័យ' });
       }
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
