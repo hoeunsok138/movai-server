@@ -14756,6 +14756,104 @@ async function apiRoute(req, res, urlPath) {
     }
     return mvLyricsTranscribeChunked(full.buf, mvLyricsFileName(full.contentType, audioUrl), full.contentType, lang);
   }
+  // ---- MV Auto Scan matching (server port of the MV page's
+  // mvAutoAlignLines / mvAutoWords / mvAutoFindWord / mvAutoSpanWords /
+  // mvNormTok / mvTextLines / mvIsStageDir, 2026-11-25) ----
+  // Lyrics text comes ONLY from the known lyrics the user gave.
+  // Whisper words are TIMING ONLY: they never appear in the output
+  // (the `t` in a returned word is a slice of the ORIGINAL lyric line).
+  // A line that cannot be confidently matched gets NO time (null) —
+  // the page's proportional fallback time is NOT ported: an invented
+  // time is worse than a missing one, and Manual Sync fixes the flag.
+  function mvScanNormTok(t) { return String(t || '').toLowerCase().replace(/[^\u1780-\u17FFa-z0-9]/g, ''); }
+  function mvScanIsStageDir(s) { if (!/^\([^)]*\)$/.test(s)) return false; return /(intro|verse|chorus|pre-chorus|bridge|outro|interlude|hook|refrain|instrumental|solo|\u179f\u17c6\u17a1\u17c1\u1784|\u1785\u17d2\u179a\u17c0\u1784|\u178f\u1793\u17d2\u178f\u17d2\u179a\u17b8)/i.test(s); }
+  function mvScanTextLines(text) { return String(text || '').split(/\r?\n/).map(function (x) { return x.replace(/^\s+|\s+$/g, ''); }).filter(function (x) { return x && !/^\[[^\]]*\]$/.test(x) && !mvScanIsStageDir(x); }); }
+  function mvScanWords(wlines) {
+    const out = [];
+    if (!wlines) return out;
+    for (let i = 0; i < wlines.length; i++) {
+      const L = wlines[i] || {};
+      const ws = L.words;
+      if (Array.isArray(ws) && ws.length) {
+        for (let j = 0; j < ws.length; j++) {
+          const w = ws[j] || {};
+          if (typeof w.start !== 'number') continue;
+          out.push({ t: mvScanNormTok(w.word || w.text || w.token || ''), start: w.start, end: typeof w.end === 'number' && w.end > w.start ? w.end : w.start + 0.2 });
+        }
+      } else if (typeof L.start === 'number' && typeof L.end === 'number' && L.end > L.start) {
+        const toks = String(L.text || '').split(/[\s\u200B]+/).filter(function (x) { return x.length; });
+        let total = 0, k;
+        for (k = 0; k < toks.length; k++) total += Math.max(1, toks[k].length);
+        let acc = 0;
+        for (k = 0; k < toks.length; k++) {
+          const len = Math.max(1, toks[k].length);
+          const s0 = L.start + (L.end - L.start) * (total ? acc / total : 0);
+          acc += len;
+          const s1 = L.start + (L.end - L.start) * (total ? acc / total : 1);
+          out.push({ t: mvScanNormTok(toks[k]), start: s0, end: Math.max(s1, s0 + 0.05) });
+        }
+      }
+    }
+    return out;
+  }
+  function mvScanFindWord(words, tok, from, win) {
+    let i; const lim = Math.min(words.length, from + win);
+    for (i = from; i < lim; i++) { if (words[i].t && words[i].t === tok) return i; }
+    if (tok.length >= 2) {
+      for (i = from; i < lim; i++) { const w = words[i].t; if (w && w.length >= 2 && (w.indexOf(tok) >= 0 || tok.indexOf(w) >= 0)) return i; }
+    }
+    return -1;
+  }
+  function mvScanSpanWords(toks, mw) {
+    if (!toks || !toks.length || !mw || !mw.length) return null;
+    const n = mw.length; let ts, i;
+    if (n === toks.length) { ts = toks.slice(); } else {
+      const text = toks.join(' '), total = Math.max(1, text.length); ts = [];
+      for (i = 0; i < n; i++) {
+        let a = Math.floor(i * total / n), b = Math.floor((i + 1) * total / n);
+        if (b <= a) b = a + 1; if (b > text.length) b = text.length;
+        ts.push(text.slice(a, b));
+      }
+    }
+    const out = [];
+    for (i = 0; i < n; i++) {
+      const w = mw[i];
+      out.push({ t: ts[i], start: w.start, end: (typeof w.end === 'number' && w.end > w.start) ? w.end : w.start + 0.2 });
+    }
+    return out;
+  }
+  // lines: [{text}] (exact original text, never changed). wlines: Whisper
+  // lines from mvLyricsTranscribeSong. Returns {matched, total,
+  // singingStart, lines:[{text, start, end, words, matched}]}.
+  function mvScanAlignLines(lines, wlines) {
+    const words = mvScanWords(wlines);
+    const out = lines.map(function (L) { return { text: L.text, start: null, end: null, words: null, matched: false }; });
+    if (!words.length) return { matched: 0, total: lines.length, singingStart: null, lines: out };
+    let pos = 0, matched = 0, singingStart = null;
+    for (let i = 0; i < lines.length; i++) {
+      const L = lines[i];
+      const toks = String(L.text || '').split(/[\s\u200B]+/).filter(function (x) { return x.length; });
+      const normToks = toks.map(mvScanNormTok).filter(function (x) { return x.length; });
+      if (!normToks.length) continue;
+      const first = mvScanFindWord(words, normToks[0], pos, 12);
+      if (first < 0) continue;
+      let p = first, lastEnd = words[first].end, used = 0; const mw = [];
+      for (let k = 0; k < normToks.length; k++) {
+        const idx = mvScanFindWord(words, normToks[k], p, 6);
+        if (idx >= 0) { lastEnd = words[idx].end; p = idx + 1; used++; mw.push(words[idx]); }
+      }
+      if (!used) continue;
+      const ns = words[first].start;
+      out[i].start = ns;
+      out[i].end = lastEnd;
+      out[i].words = mvScanSpanWords(toks, mw);
+      out[i].matched = true;
+      if (singingStart === null) singingStart = ns;
+      matched++; pos = p;
+    }
+    return { matched: matched, total: lines.length, singingStart: singingStart, lines: out };
+  }
+
   if (req.method === 'POST' && urlPath === '/api/mv/lyrics') {
     readJSONBody(req, 64 * 1024).then(async (body) => {
       // Music Video lock (owner order 2026-11-24): when locked,
@@ -14811,6 +14909,79 @@ async function apiRoute(req, res, urlPath) {
       }
       const outLyrics = tr.lyrics.map((l, i) => ({ text: (translated[i] !== undefined ? translated[i] : l.text), start: l.start, end: l.end, ...(l.words ? { words: l.words } : {}) }));
       return sendJSON(res, 200, { ok: true, language, translatedTo: translateTo, lyrics: outLyrics });
+    }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
+    return;
+  }
+
+  // POST /api/mv/auto-scan — PUBLIC. {email, url, lyrics, language}.
+  // Auto Scan helper for the MV Generator (owner order 2026-11-25):
+  // Groq Whisper word timings + the server-side lyric matcher above.
+  // The lyrics text is NEVER changed and NEVER comes from Whisper —
+  // only the TIMING is attached to the exact original lines. Unmatched
+  // lines get start/end null (never a guessed time) so Manual Sync can
+  // fix them. Same mvLocked gate as /api/mv/lyrics. The result is also
+  // stored on the song's history item (field `autoScan`) via the same
+  // history store/merge so it survives reloads.
+  if (req.method === 'POST' && urlPath === '/api/mv/auto-scan') {
+    readJSONBody(req, 512 * 1024).then(async (body) => {
+      const _fs2 = await featureSettingsLoad();
+      if (_fs2.mvLocked) return sendJSON(res, 200, { ok: false, error: 'Music Video ត្រូវបានបិទដោយ Admin · Music Video is disabled by the Admin', code: 'mv_locked' });
+      await logActivity({ at: new Date().toISOString(), mode: 'mv-auto-scan' });
+      const email = normEmail(body && body.email);
+      const audioUrl = body && typeof body.url === 'string' ? body.url.trim() : (body && typeof body.audioUrl === 'string' ? body.audioUrl.trim() : '');
+      let lyrics = body && typeof body.lyrics === 'string' ? body.lyrics : '';
+      if (lyrics.length > 20000) lyrics = lyrics.slice(0, 20000);
+      let u2;
+      try { u2 = new URL(audioUrl); } catch (e) { u2 = null; }
+      if (!u2 || (u2.protocol !== 'http:' && u2.protocol !== 'https:') || audioUrl.length > 2000) {
+        return sendJSON(res, 200, { ok: false, error: 'សូមដាក់លីងបទចម្រៀងត្រឹមត្រូវ · Please provide a valid song audio URL' });
+      }
+      // Lyrics source: the given lyrics; else the song's stored lyrics /
+      // prompt from history; else nothing to align.
+      if (!lyrics.trim() && email) {
+        try {
+          const _h = await loadHistory();
+          const _arr = Array.isArray(_h[email]) ? _h[email] : [];
+          const _it = _arr.find(function (x) { return x && (x.url === audioUrl || x.src === audioUrl); });
+          if (_it) lyrics = String(_it.lyrics || _it.prompt || '');
+        } catch (e) {}
+      }
+      const lineTexts = mvScanTextLines(lyrics);
+      if (!lineTexts.length) return sendJSON(res, 200, { ok: false, error: 'no_lyrics' });
+      // Language: explicit code wins; else Khmer when the lyrics are
+      // Khmer (same detection as the MV page); else auto-detect.
+      const langReq2 = body && typeof body.language === 'string' ? body.language.trim().toLowerCase() : '';
+      const lang2 = /^[a-z]{2,3}$/.test(langReq2) ? langReq2 : (/[\u1780-\u17FF]/.test(lyrics) ? 'km' : '');
+      let tr2;
+      try {
+        tr2 = await mvLyricsTranscribeSong(audioUrl, lang2);
+      } catch (e) {
+        if (e && e.noKey) return sendJSON(res, 200, { ok: false, error: 'Admin មិនទាន់ដាក់ Groq API Key ទេ · Admin has not set a Groq API Key yet' });
+        return sendJSON(res, 200, { ok: false, error: 'ស្ដាប់បទចម្រៀងមិនបាន (Whisper) · Could not transcribe the song (Whisper)' });
+      }
+      if (!tr2 || !tr2.ok || !tr2.lyrics || !tr2.lyrics.length) {
+        return sendJSON(res, 200, { ok: false, error: 'រកមិនឃើញអត្ថបទចម្រៀងក្នុងបទនេះទេ · No lyrics were found in this song' });
+      }
+      const res2 = mvScanAlignLines(lineTexts.map(function (t) { return { text: t }; }), tr2.lyrics);
+      const unmatched = [];
+      res2.lines.forEach(function (L, idx) { if (!L.matched) unmatched.push(idx); });
+      const autoScan = { lines: res2.lines, singingStart: res2.singingStart, scannedAt: new Date().toISOString(), language: tr2.language || lang2 || '' };
+      // Store on the song's history item (same store + key as the
+      // POST /api/public/history merge: by id, else by url). Best
+      // effort — a store failure must not fail the scan result.
+      if (email) {
+        try {
+          const h2 = await loadHistory();
+          const arr2 = Array.isArray(h2[email]) ? h2[email] : [];
+          const it2 = arr2.find(function (x) { return x && (x.url === audioUrl || x.src === audioUrl); });
+          if (it2) {
+            it2.autoScan = autoScan;
+            it2.ts = Date.now();
+            await saveHistory(h2);
+          }
+        } catch (e) {}
+      }
+      return sendJSON(res, 200, { ok: true, language: tr2.language || lang2 || '', lines: res2.lines, singingStart: res2.singingStart, matched: res2.matched, total: res2.total, unmatched: unmatched });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
