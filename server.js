@@ -9396,7 +9396,7 @@ async function apiRoute(req, res, urlPath) {
   // ---- MV lyrics (karaoke) — transcription via Groq Whisper ----
   // POST /api/mv/lyrics {audioUrl, translateTo?} — PUBLIC (no admin key).
   // Fetches the song audio (in-memory only, never to disk), transcribes it
-  // with Groq Whisper (whisper-large-v3-turbo, verbose_json) and returns
+  // with Groq Whisper (whisper-large-v3, verbose_json) and returns
   // timed lyric lines in the language the song is sung in. NO translation
   // by default; when translateTo is given, the lines are translated with
   // Groq chat (gpt-oss-120b) keeping the same timings. Groq Whisper
@@ -9476,7 +9476,7 @@ async function apiRoute(req, res, urlPath) {
     // burning the other keys.
     const fd = new FormData();
     fd.append('file', new Blob([buf], { type: mvLyricsMime(fileName) }), fileName);
-    fd.append('model', 'whisper-large-v3-turbo');
+    fd.append('model', 'whisper-large-v3');
     fd.append('response_format', 'verbose_json');
     // Khmer fix: telling Whisper the language stops it guessing wrong
     // and mixing English words into Khmer lyrics. Word timestamps let
