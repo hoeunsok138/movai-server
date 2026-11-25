@@ -11381,6 +11381,16 @@ async function apiRoute(req, res, urlPath) {
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
     return;
   }
+  // POST /api/admin/bg-themes/reset (admin key) resets the theme list
+  // back to the seed (bgThemesDefault) and makes theme 1 — 'default',
+  // the original look — the active theme. No body needed.
+  if (req.method === 'POST' && urlPath === '/api/admin/bg-themes/reset') {
+    const a = await adminKeyOk(req);
+    if (!a.ok) return sendJSON(res, 200, { ok: false, error: a.error });
+    const seed = bgThemesDefault();
+    const out = await bgThemesSave(seed);
+    return sendJSON(res, 200, { ok: true, theme: out.themes[0], themes: out.themes });
+  }
   // ---- Telegram shop bot on/off switch (owner order 2026-11-20 20:48) ----
   // The owner turned the telegram-gmail-bot Render service OFF (suspend)
   // to save hours, and wants an Admin switch to turn it back ON (resume)
