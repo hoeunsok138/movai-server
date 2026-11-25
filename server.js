@@ -11237,22 +11237,30 @@ async function apiRoute(req, res, urlPath) {
       if (!u) return sendJSON(res, 200, { ok: false, error: 'រកអ្នកប្រើនេះមិនឃើញទេ' });
       const dMedia = Math.floor(numOr(body.credits, 0));
       const dSong = Math.floor(numOr(body.songCredits, 0));
-      if (!dMedia && !dSong) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ចំនួន Credit' });
+      // MV grant (Admin "ផ្ដល់ MV"): bonusMv is a permanent allowance —
+      // unlike mvLeft it NEVER expires with a package, and /api/public/
+      // mv-use spends it after the 2 free plays and any package MVs.
+      // Negative deducts (clamped at 0), like credits.
+      const dMv = Math.floor(numOr(body.bonusMv, 0));
+      if (!dMedia && !dSong && !dMv) return sendJSON(res, 200, { ok: false, error: 'សូមដាក់ចំនួន Credit' });
       u.credits = Math.max(0, Math.floor(numOr(u.credits, 0)) + dMedia);
       u.songCredits = Math.max(0, Math.floor(numOr(u.songCredits, 0)) + dSong);
+      u.bonusMv = Math.max(0, Math.floor(numOr(u.bonusMv, 0)) + dMv);
       u.updatedAt = new Date().toISOString();
       await saveUsers(users);
       // Critical write: confirm the new balance is on GitHub BEFORE
       // returning success, so a restart cannot lose a granted/deducted
       // credit that the Admin app already reported as done.
       scheduleBackup('users.json');
-      await logGrant({ email, credits: dMedia, songCredits: dSong, note: typeof body.note === 'string' ? body.note.slice(0, 200) : '', at: u.updatedAt });
+      await logGrant({ email, credits: dMedia, songCredits: dSong, note: (typeof body.note === 'string' ? body.note.slice(0, 200) : '') + (dMv ? ' bonusMv:' + (dMv > 0 ? '+' : '') + dMv : ''), at: u.updatedAt });
       const deltaText = fmtCreditDelta(dMedia, dSong);
+      const mvPart = dMv ? (dMv > 0 ? '+' : '') + dMv + ' MV' : '';
+      const grantText = [deltaText === '0' ? '' : deltaText, mvPart].filter(Boolean).join(' / ') || '0';
       const grantNote = typeof body.note === 'string' ? body.note.trim().slice(0, 200) : '';
-      if (dMedia < 0 || dSong < 0) {
-        await addNotification('deduct', email, '➖ កាត់ Credit · Credits deducted', 'Admin បានកាត់ ' + deltaText + ' ពី ' + email + ' · ID: ' + (u.id || '—') + (grantNote ? ' — ' + grantNote : ''));
+      if (dMedia < 0 || dSong < 0 || dMv < 0) {
+        await addNotification('deduct', email, '➖ កាត់ Credit · Credits deducted', 'Admin បានកាត់ ' + grantText + ' ពី ' + email + ' · ID: ' + (u.id || '—') + (grantNote ? ' — ' + grantNote : ''));
       } else {
-        await addNotification('grant', email, '➕ បន្ថែម Credit · Credits granted', 'Admin បានបន្ថែម ' + deltaText + ' ឲ្យ ' + email + ' · ID: ' + (u.id || '—') + (grantNote ? ' — ' + grantNote : ''));
+        await addNotification('grant', email, '➕ បន្ថែម Credit · Credits granted', 'Admin បានបន្ថែម ' + grantText + ' ឲ្យ ' + email + ' · ID: ' + (u.id || '—') + (grantNote ? ' — ' + grantNote : ''));
       }
       return sendJSON(res, 200, { ok: true, user: await pubUser(u) });
     }).catch(() => sendJSON(res, 400, errBody('bad_request', 'ទិន្នន័យមិនត្រឹមត្រូវទេ', 'Bad request')));
