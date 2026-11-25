@@ -10725,7 +10725,13 @@ async function apiRoute(req, res, urlPath) {
     const daEms = (Array.isArray(daRec.emails) ? daRec.emails : []).filter((e) => typeof e === 'string' && e.indexOf('@') > 0).slice(0, 10);
     const daSlots = Math.floor(numOr(daRec.slots, 0));
     const daProCount = Math.max(0, daEms.length - daDl.limit);
-    return sendJSON(res, 200, { ok: true, emails: daEms.map((e, i) => ({ email: e, pro: i < daProCount })), slots: daSlots, limit: Math.min(daDl.limit + daSlots, daDl.maxAccounts), freeLimit: daDl.limit, maxAccounts: daDl.maxAccounts, deviceAccounts: daEms.length });
+    // 'free' = one of the free-limit Gmails (the oldest ones — rec.emails
+    // is newest-first, so free = index >= proCount). 'pending' = a
+    // device-slot request for this Gmail + device is still waiting for the
+    // Admin (< 24h old); the sign-in list shows it as Waiting.
+    const daReqs = await loadPurchaseRequests();
+    const daPending = (em) => daReqs.some((x) => x && x.kind === 'device-slot' && String(x.email || '').toLowerCase() === String(em).toLowerCase() && String(x.fingerprint || '') === 'id:' + daDid && x.status === 'pending' && (Date.now() - new Date(x.createdAt || 0).getTime()) < 86400000);
+    return sendJSON(res, 200, { ok: true, emails: daEms.map((e, i) => ({ email: e, pro: i < daProCount, free: i >= daProCount, pending: daPending(e) })), slots: daSlots, limit: Math.min(daDl.limit + daSlots, daDl.maxAccounts), freeLimit: daDl.limit, maxAccounts: daDl.maxAccounts, deviceAccounts: daEms.length });
   }
   // GET /api/admin/gift-50 — admin key required. Reads the new-user
   // gift-50 toggle (default OFF). POST /api/admin/gift-50 {enabled}
@@ -12463,6 +12469,13 @@ async function apiRoute(req, res, urlPath) {
         if (!dsRec || typeof dsRec !== 'object') return sendJSON(res, 200, { ok: false, error: 'រកឧបករណ៍នេះមិនឃើញទេ · Device not found' });
         if (dsRec.blocked) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះត្រូវបានប្លុក — សូមទាក់ទង Admin · This device is blocked — please contact the Admin' });
         if (Math.floor(numOr(dsRec.slots, 0)) >= Math.max(0, dsDl.maxAccounts - dsDl.limit)) return sendJSON(res, 200, { ok: false, error: 'ឧបករណ៍នេះមានគណនីច្រើនបំផុត ' + dsDl.maxAccounts + ' ហើយ · This device already has the maximum accounts' });
+        // One request per Gmail per 24h (owner order 2026-11-25): a pending
+        // or rejected device-slot request for this Gmail + device within
+        // the last 24h is refused — after 24h it resets and the user can
+        // ask again (if it was not successful). An approved request never
+        // blocks, because the slot is already granted.
+        const dsDup = reqs.some((x) => x && x.kind === 'device-slot' && String(x.email || '').toLowerCase() === email && String(x.fingerprint || '') === dsFp && (x.status === 'pending' || x.status === 'rejected') && (Date.now() - new Date(x.createdAt || 0).getTime()) < 86400000);
+        if (dsDup) return sendJSON(res, 200, { ok: false, error: 'អ្នកធ្លាប់ផ្ញើសំណើរនេះម្តងហើយ — សូមរង់ចាំ 24 ម៉ោង ទើបអាចផ្ញើម្ដងទៀតបាន · You already sent this request once — please wait 24 hours before sending again', alreadySent: true });
         packageId = 'device-slot';
         dsSlotPrice = dsDl.slotPrice;
         dsFingerprint = dsFp;
